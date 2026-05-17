@@ -1,10 +1,10 @@
-# zerostack
+# zerostack-plus
 
-Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/latest/usage) and [opencode](https://opencode.ai/).
+Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/latest/usage) and [opencode](https://opencode.ai/). A fork of [zerostack](https://github.com/gi-dellav/zerostack) with additional provider support.
 
 ## Features
 
-- **Multi-provider**: OpenRouter, OpenAI, Anthropic, Gemini, Ollama, plus custom providers
+- **Multi-provider**: OpenRouter, OpenAI, Anthropic, Gemini, Ollama, DeepSeek, plus custom providers
 - **Standard tools**: all of the standard tools exposed to coding agents, as described by the opencode documentation.
 - **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
 - **Session management**: save/load/resume sessions, auto-compaction to stay within context windows
@@ -19,7 +19,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 
 ## Performance
 
-_zerostack_ is one of the smallest and most performant coding agents on the market.
+_zerostack-plus_ is one of the smallest and most performant coding agents on the market.
 
 - Lines of code: ~7k LoC
 - Binary size: 8.9MB
@@ -28,13 +28,13 @@ _zerostack_ is one of the smallest and most performant coding agents on the mark
 
 ## Installation
 
-In order to install _zerostack_, you must have Cargo and git installed. Then, run:
+In order to install _zerostack-plus_, you must have Cargo and git installed. Then, run:
 
 ```bash
-cargo install zerostack
+cargo install --git https://github.com/term-guy/zerostack-plus
 ```
 
-You are now ready to work with a lightweight coding agent! (Note: you can also find pre-built binaries on Github Releases)
+You are now ready to work with a lightweight coding agent!
 
 ### Optional: sandbox mode
 
@@ -71,8 +71,12 @@ zerostack -p "Explain this project"
 # Continue last session
 zerostack -c
 
-# Explicit provider/model
+# Explicit provider/model (via OpenRouter)
 zerostack --provider openrouter --model deepseek/deepseek-v4-flash
+
+# Use DeepSeek directly
+export DEEPSEEK_API_KEY="[api_key]"
+zerostack --provider deepseek --model deepseek-v4-flash
 ```
 
 ## Configuration
@@ -82,7 +86,7 @@ aliases, permission rules, and MCP server configuration.
 
 ## Prompts system
 
-_zerostack_ includes a set of built-in system prompts that change the agent's behavior and tone.  
+_zerostack-plus_ includes a set of built-in system prompts that change the agent's behavior and tone.  
 The idea is to build a complete suite of prompts that can fully substitute skills like [superpower](https://github.com/obra/superpowers) or the [Claude's official skills](https://github.com/anthropics/claude-plugins-official/tree/main).  
 You can switch between different prompts or list all registered prompts using `/prompt`.
 
@@ -110,7 +114,7 @@ system prompt. Use `-n` / `--no-context-files` to disable this.
 
 ## Permission system
 
-zerostack has four permission modes, from safest to most permissive:
+zerostack-plus has four permission modes, from safest to most permissive:
 
 1. **restrictive** (`-R`): every tool action prompts for approval unless
    explicitly allowed in config
@@ -153,7 +157,7 @@ resume the most recent session, `-r` to browse and select one, or
 
 ## Loop system
 
-_zerostack_ includes an iterative coding loop for long-horizon tasks. The agent repeatedly reads the task, picks an item from the plan, works on it, runs tests, updates the plan, and loops until the task is complete or the iteration limit is reached.
+_zerostack-plus_ includes an iterative coding loop for long-horizon tasks. The agent repeatedly reads the task, picks an item from the plan, works on it, runs tests, updates the plan, and loops until the task is complete or the iteration limit is reached.
 
 **NOTE** The loop system is an _experimental_ feature.
 
@@ -187,7 +191,7 @@ zerostack --loop --loop-prompt "Refactor the API" --loop-max 10 --loop-run "carg
 
 ## Git worktrees integration
 
-_zerostack_ provides a branch-per-task workflow using git worktrees. You can create, work in, merge, and exit worktrees entirely from the chat UI.
+_zerostack-plus_ provides a branch-per-task workflow using git worktrees. You can create, work in, merge, and exit worktrees entirely from the chat UI.
 
 **NOTE** The git worktrees integration is an _experimental_ feature.
 
@@ -204,20 +208,24 @@ The worktrees integrations offers 3 slash commands:
 ### Example workflow for git worktrees
 
 1. **Create** — `/worktree feature-x` creates a new branch and worktree directory and moves you there.
-2. **Work** — Use zerostack normally; changes stay on the feature branch.
+2. **Work** — Use zerostack-plus normally; changes stay on the feature branch.
 3. **Merge** — `/wt-merge` tells the agent to merge the branch, push, clean up, and return to the main repo.
 4. **Exit** — `/wt-exit` immediately returns to the main repo without merging.
 
 ## Supported providers
 
-- OpenRouter (default)
-- OpenAI-compatible (vLLM, LiteLLM, etc.)
-- Anthropic
-- Gemini
-- Ollama
+| Provider | Env var | Notes |
+| -------- | ------- | ----- |
+| `openrouter` (default) | `OPENROUTER_API_KEY` | Access to all models via a single key |
+| `openai` | `OPENAI_API_KEY` | Also works with any OpenAI-compatible endpoint (vLLM, LiteLLM, etc.) |
+| `anthropic` | `ANTHROPIC_API_KEY` | |
+| `gemini` / `google` | `GEMINI_API_KEY` | |
+| `ollama` | — | No key required; set a custom base URL if needed |
+| `deepseek` | `DEEPSEEK_API_KEY` | Native DeepSeek API (`deepseek-chat`, `deepseek-reasoner`, `deepseek-v4-flash`, `deepseek-v4-pro`) |
+| `custom` | `CUSTOM_API_KEY` | Any OpenAI-compatible endpoint via `CUSTOM_BASE_URL` |
 
-Custom providers can be configured with any base URL and API key environment
-variable in  `$XDG_CONFIG_HOME/zerostack/config.json`.
+Custom providers can also be configured with aliases, base URLs, and API key environment
+variables in `$XDG_CONFIG_HOME/zerostack/config.json` — see [CONFIG.md](CONFIG.md).
 
 ## License
 
