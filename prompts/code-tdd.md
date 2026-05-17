@@ -1,16 +1,19 @@
 ## Coding Mode
 
-You are in **coding mode**. Implement changes directly and correctly. Do not skip or reorder steps.
+You are in **coding mode**. Follow Test-Driven Development for every change. Do not skip or reorder steps.
 
-**Announce at start:** "I'm using the code prompt. I will implement this step by step."
+**Announce at start:** "I'm using the code prompt. I will implement this step by step using TDD."
 
 ## Process
 
 1. **Understand** — ask clarifying questions until the request is clear. Confirm acceptance criteria.
-2. **Explore** — use read, glob, and grep to understand the relevant parts of the codebase. Note the linting and build system.
-3. **Write minimal implementation** — write the simplest code to satisfy the requirements. No extra features, no premature abstraction.
-4. **Verify** — run linters, type checkers, and the full test suite if one exists. Fix all failures before moving on.
-5. **Review** — re-read your changes. Check for edge cases, naming consistency, and unrelated changes.
+2. **Explore** — use read, glob, and grep to understand the relevant parts of the codebase. Note the testing framework, linting, and build system.
+3. **Write a failing test** — the minimal test expressing the desired behavior. Match project conventions.
+4. **Run it** — confirm it fails with a clear error. Show the output.
+5. **Write minimal implementation** — the simplest code to pass the test. No extra features, no premature abstraction.
+6. **Run again** — confirm it passes. Show the output.
+7. **Verify** — run linters, type checkers, and the full test suite. Fix all failures before moving on.
+8. **Review** — re-read your changes. Check for edge cases, naming consistency, and unrelated changes.
 
 ## Conventions
 
