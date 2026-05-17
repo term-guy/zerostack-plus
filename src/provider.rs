@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rig::agent::Agent;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, Message};
-use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
+use rig::providers::{anthropic, deepseek, gemini, ollama, openai, openrouter};
 use rig::streaming::StreamingChat;
 
 use crate::agent::builder;
@@ -26,6 +26,7 @@ pub enum ProviderKind {
     Anthropic,
     Gemini,
     Ollama,
+    DeepSeek,
     Custom,
 }
 
@@ -36,6 +37,7 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
         "anthropic" => Some(ProviderKind::Anthropic),
         "gemini" | "google" => Some(ProviderKind::Gemini),
         "ollama" => Some(ProviderKind::Ollama),
+        "deepseek" => Some(ProviderKind::DeepSeek),
         "custom" => Some(ProviderKind::Custom),
         _ => None,
     }
@@ -74,6 +76,7 @@ fn provider_env_var(kind: ProviderKind) -> &'static str {
         ProviderKind::Gemini => "GEMINI_API_KEY",
         ProviderKind::Ollama => "OLLAMA_API_KEY",
         ProviderKind::OpenRouter => "OPENROUTER_API_KEY",
+        ProviderKind::DeepSeek => "DEEPSEEK_API_KEY",
         ProviderKind::Custom => "CUSTOM_API_KEY",
     }
 }
@@ -122,6 +125,7 @@ pub enum AnyClient {
     Anthropic(anthropic::Client),
     Gemini(gemini::Client),
     Ollama(ollama::Client),
+    DeepSeek(deepseek::Client),
     Custom(openai::CompletionsClient),
 }
 
@@ -134,6 +138,7 @@ impl AnyClient {
             AnyClient::Anthropic(c) => AnyModel::Anthropic(c.completion_model(name)),
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
+            AnyClient::DeepSeek(c) => AnyModel::DeepSeek(c.completion_model(name)),
             AnyClient::Custom(c) => AnyModel::Custom(c.completion_model(name)),
         }
     }
@@ -172,6 +177,7 @@ async fn summarize_with_model(model: AnyModel, prompt: String) -> anyhow::Result
         AnyModel::Anthropic(m) => run_summarizer(m, prompt).await,
         AnyModel::Gemini(m) => run_summarizer(m, prompt).await,
         AnyModel::Ollama(m) => run_summarizer(m, prompt).await,
+        AnyModel::DeepSeek(m) => run_summarizer(m, prompt).await,
         AnyModel::Custom(m) => run_summarizer(m, prompt).await,
     }
 }
@@ -232,6 +238,7 @@ pub enum AnyModel {
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
     Ollama(ollama::CompletionModel),
+    DeepSeek(deepseek::CompletionModel),
     Custom(openai::completion::CompletionModel),
 }
 
@@ -242,6 +249,7 @@ pub enum AnyAgent {
     Anthropic(Agent<anthropic::completion::CompletionModel>),
     Gemini(Agent<gemini::completion::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
+    DeepSeek(Agent<deepseek::CompletionModel>),
     Custom(Agent<openai::completion::CompletionModel>),
 }
 
@@ -253,6 +261,7 @@ impl AnyAgent {
             AnyAgent::Anthropic(a) => runner::run_print(a, prompt, max_turns, context_window).await,
             AnyAgent::Gemini(a) => runner::run_print(a, prompt, max_turns, context_window).await,
             AnyAgent::Ollama(a) => runner::run_print(a, prompt, max_turns, context_window).await,
+            AnyAgent::DeepSeek(a) => runner::run_print(a, prompt, max_turns, context_window).await,
             AnyAgent::Custom(a) => runner::run_print(a, prompt, max_turns, context_window).await,
         }
     }
@@ -264,6 +273,7 @@ impl AnyAgent {
             AnyAgent::Anthropic(a) => runner::spawn_agent(a, prompt, history),
             AnyAgent::Gemini(a) => runner::spawn_agent(a, prompt, history),
             AnyAgent::Ollama(a) => runner::spawn_agent(a, prompt, history),
+            AnyAgent::DeepSeek(a) => runner::spawn_agent(a, prompt, history),
             AnyAgent::Custom(a) => runner::spawn_agent(a, prompt, history),
         }
     }
@@ -276,7 +286,7 @@ pub fn create_client(
 ) -> anyhow::Result<AnyClient> {
     let info = resolve_provider_info(provider_name, custom_providers).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, ollama, custom",
+            "Unknown provider: {}. Supported providers: openrouter, openai, anthropic, gemini, ollama, deepseek, custom",
             provider_name
         )
     })?;
@@ -326,6 +336,13 @@ pub fn create_client(
             }
             Ok(AnyClient::OpenRouter(b.build()?))
         }
+        ProviderKind::DeepSeek => {
+            let mut b = deepseek::Client::builder().api_key(&key);
+            if let Some(base_url) = &base_url {
+                b = b.base_url(base_url);
+            }
+            Ok(AnyClient::DeepSeek(b.build()?))
+        }
         ProviderKind::Custom => {
             let base_url = base_url.ok_or_else(|| {
                 anyhow::anyhow!("CUSTOM_BASE_URL environment variable must be set for custom provider")
@@ -364,7 +381,11 @@ pub async fn build_agent(
             #[cfg(feature = "mcp")] mcp_manager,
         ).await),
         AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_agent_inner(
-            m, cli, cfg, context, permission, ask_tx, sandbox,
+            m, cli, cfg, context, permission, ask_tx, sandbox.clone(),
+            #[cfg(feature = "mcp")] mcp_manager,
+        ).await),
+        AnyModel::DeepSeek(m) => AnyAgent::DeepSeek(builder::build_agent_inner(
+            m, cli, cfg, context, permission, ask_tx, sandbox.clone(),
             #[cfg(feature = "mcp")] mcp_manager,
         ).await),
         AnyModel::Custom(m) => AnyAgent::Custom(builder::build_agent_inner(
