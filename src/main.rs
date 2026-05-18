@@ -148,6 +148,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    #[cfg(feature = "acp")]
+    if cli.acp_enabled {
+        return extras::acp::serve(cli, cfg, context).await;
+    }
+
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
     let (permission, ask_tx, ask_rx) = build_permission_checker(&cli, &cfg);
 

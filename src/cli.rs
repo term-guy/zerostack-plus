@@ -90,6 +90,21 @@ pub struct Cli {
     )]
     pub loop_mode: bool,
 
+    #[cfg(feature = "acp")]
+    #[arg(
+        long = "acp",
+        help = "Enable ACP (Agent Communication Protocol) support"
+    )]
+    pub acp_enabled: bool,
+
+    #[cfg(feature = "acp")]
+    #[arg(long = "acp-host", help = "ACP TCP bind host [default: stdio mode]")]
+    pub acp_host: Option<String>,
+
+    #[cfg(feature = "acp")]
+    #[arg(long = "acp-port", help = "ACP TCP bind port [default: 7243]")]
+    pub acp_port: Option<u16>,
+
     #[cfg(feature = "loop")]
     #[arg(long = "loop-prompt", help = "Prompt for each loop iteration")]
     pub loop_prompt: Option<String>,
