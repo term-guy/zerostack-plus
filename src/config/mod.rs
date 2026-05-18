@@ -41,6 +41,7 @@ pub struct Config {
     pub default_permission_mode: Option<String>,
     pub show_tool_details: Option<bool>,
     pub default_prompt: Option<String>,
+    pub shell: Option<String>,
     #[cfg(feature = "mcp")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
 
@@ -107,7 +108,7 @@ pub fn load() -> Config {
     #[cfg(feature = "mcp")]
     if cfg.mcp_servers.is_none() {
         let mut headers = HashMap::new();
-        if let Some(key) = std::env::var("EXA_API_KEY").ok() {
+        if let Ok(key) = std::env::var("EXA_API_KEY") {
             headers.insert("x-api-key".to_string(), key);
         }
         let mut defaults = HashMap::new();

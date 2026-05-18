@@ -108,7 +108,7 @@ fn resolve_api_key(
         return Ok(String::new());
     }
 
-    if kind == ProviderKind::Custom {
+    if kind == ProviderKind::Custom || api_key_env_override.is_some() {
         return Ok(String::new());
     }
 
@@ -252,11 +252,7 @@ pub enum AnyAgent {
 }
 
 impl AnyAgent {
-    pub async fn run_print(
-        &self,
-        prompt: &str,
-        max_turns: usize,
-    ) -> anyhow::Result<String> {
+    pub async fn run_print(&self, prompt: &str, max_turns: usize) -> anyhow::Result<String> {
         match self {
             AnyAgent::OpenRouter(a) => runner::run_print(a, prompt, max_turns).await,
             AnyAgent::OpenAI(a) => runner::run_print(a, prompt, max_turns).await,
@@ -295,11 +291,13 @@ pub fn create_client(
 
     let key = resolve_api_key(info.kind, info.api_key_env.as_deref(), api_key)?;
 
-    let base_url = if info.kind == ProviderKind::Custom {
-        std::env::var("CUSTOM_BASE_URL").ok()
-    } else {
-        info.base_url
-    };
+    let base_url = info.base_url.or_else(|| {
+        if info.kind == ProviderKind::Custom {
+            std::env::var("CUSTOM_BASE_URL").ok()
+        } else {
+            None
+        }
+    });
 
     match info.kind {
         ProviderKind::OpenAI => {
@@ -359,6 +357,7 @@ pub fn create_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn build_agent(
     model: AnyModel,
     cli: &Cli,
@@ -367,6 +366,7 @@ pub async fn build_agent(
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
+    reasoning_enabled: bool,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
     match model {
@@ -379,6 +379,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -393,6 +394,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -407,6 +409,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -421,6 +424,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -449,6 +453,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox,
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -463,6 +468,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )

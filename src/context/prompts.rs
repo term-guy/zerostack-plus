@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
 
 static EMBEDDED: Dir = include_dir!("$CARGO_MANIFEST_DIR/prompts");
 
 pub fn global_prompts_dir() -> PathBuf {
-    crate::session::storage::config_path().join("prompts")
+    crate::session::storage::data_dir().join("prompts")
 }
 
 pub fn load() -> HashMap<String, String> {
@@ -71,7 +71,7 @@ pub fn regen() -> anyhow::Result<()> {
     copy_embedded(&dir)
 }
 
-fn copy_embedded(dest: &PathBuf) -> anyhow::Result<()> {
+fn copy_embedded(dest: &Path) -> anyhow::Result<()> {
     for file in EMBEDDED.files() {
         if let Some(name) = file.path().file_name().and_then(|s| s.to_str()) {
             let dest_path = dest.join(name);

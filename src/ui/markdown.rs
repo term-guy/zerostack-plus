@@ -4,9 +4,9 @@ use pulldown_cmark::{Event, Tag, TagEnd};
 
 use super::renderer::LineEntry;
 
-fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
-    if text.is_empty() {
-        return vec![CompactString::new("")];
+pub(crate) fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
+    if text.is_empty() || max_width == 0 {
+        return vec![CompactString::from(text)];
     }
     let chars: Vec<char> = text.chars().collect();
     if chars.len() <= max_width {
@@ -194,7 +194,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     let bullet = if ordered_list {
                         format!(" {}. ", list_item_count)
                     } else {
-                        format!("{}", bullet_prefix(color))
+                        bullet_prefix(color).to_string()
                     };
                     let mut item_lines = Vec::new();
                     let mut first = true;
@@ -236,30 +236,18 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 _ => {}
             },
             Event::Text(t) => {
-                if in_code_block {
-                    acc.push_str(&t);
-                } else {
-                    acc.push_str(&t);
-                }
+                acc.push_str(&t);
             }
             Event::Code(t) => {
-                if in_code_block {
-                    acc.push_str(&t);
-                } else {
-                    acc.push_str(&t);
-                }
+                acc.push_str(&t);
             }
             Event::SoftBreak | Event::HardBreak => {
-                if in_code_block {
-                    acc.push('\n');
-                } else {
-                    acc.push('\n');
-                }
+                acc.push('\n');
             }
             Event::Rule => {
                 flush_acc(&acc, Color::White, max_width, &mut result);
                 acc.clear();
-                let rule: String = std::iter::repeat('─').take(max_width.min(40)).collect();
+                let rule: String = "─".repeat(max_width.min(40));
                 result.push(LineEntry {
                     text: CompactString::from(rule),
                     color: Color::DarkGrey,
