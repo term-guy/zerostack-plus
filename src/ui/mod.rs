@@ -12,7 +12,7 @@ use std::io;
 
 use compact_str::CompactString;
 use crossterm::event;
-use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
@@ -120,7 +120,7 @@ fn refresh_display(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
-    client: AnyClient,
+    mut client: AnyClient,
     mut agent: AnyAgent,
     cli: &Cli,
     cfg: &Config,
@@ -139,6 +139,15 @@ pub async fn run_interactive(
     let mut input = InputEditor::new();
     input.set_monochrome(cli.no_color);
     input.set_prompt_names(context.prompts.keys().cloned().collect());
+    if let Some(editor) = &cfg.editor {
+        input.set_editor(editor.clone());
+    }
+    input.set_quick_model_names(
+        cfg.quick_models
+            .as_ref()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+    );
     input.load_global_history();
     let mut is_running = false;
     let mut agent_rx: Option<mpsc::Receiver<AgentEvent>> = None;
@@ -167,8 +176,13 @@ pub async fn run_interactive(
 
     render_session(&mut renderer, session, cli, cfg, context)?;
     refresh_display(
-        &mut renderer, &input, session, false,
-        None, context.current_prompt_name.as_deref(), perm_mode().as_deref(),
+        &mut renderer,
+        &input,
+        session,
+        false,
+        None,
+        context.current_prompt_name.as_deref(),
+        perm_mode().as_deref(),
     )?;
 
     let (user_tx, mut user_rx) = mpsc::channel::<UserEvent>(64);
@@ -177,7 +191,9 @@ pub async fn run_interactive(
         loop {
             match event::read() {
                 Ok(event::Event::Key(key)) => {
-                    if user_tx_clone.blocking_send(UserEvent::Key(key)).is_err() {
+                    if key.kind == KeyEventKind::Press
+                        && user_tx_clone.blocking_send(UserEvent::Key(key)).is_err()
+                    {
                         break;
                     }
                 }
@@ -367,7 +383,7 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
                                 }
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut reasoning_enabled, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager).await;
+                                let result = handle_slash(&text, &mut agent, &mut client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut reasoning_enabled, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -377,7 +393,7 @@ pub async fn run_interactive(
                                     });
                                         let compress_result = handle_compress(
                                             instructions.as_deref(),
-                                            &mut agent, &client, &mut renderer, session, cli, cfg, context,
+                                            &mut agent, &mut client, &mut renderer, session, cli, cfg, context,
                                             reasoning_enabled,
                                             &permission, &ask_tx, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager,
@@ -634,7 +650,7 @@ pub async fn run_interactive(
                             renderer.write_line("auto-compacting...", Color::DarkGrey)?;
                             let compress_result = handle_compress(
                                 None,
-                                &mut agent, &client, &mut renderer, session, cli, cfg, context,
+                                &mut agent, &mut client, &mut renderer, session, cli, cfg, context,
                                 reasoning_enabled,
                                 &permission, &ask_tx, &sandbox,
                                 #[cfg(feature = "mcp")] mcp_manager,
