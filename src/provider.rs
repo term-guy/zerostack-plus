@@ -88,6 +88,7 @@ fn provider_kind_slug(kind: ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Gemini => "gemini",
         ProviderKind::Ollama => "ollama",
+        ProviderKind::DeepSeek => "deepseek",
         ProviderKind::Custom => "custom",
     }
 }
@@ -460,6 +461,7 @@ pub async fn build_agent(
                 permission,
                 ask_tx,
                 sandbox.clone(),
+                reasoning_enabled,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
