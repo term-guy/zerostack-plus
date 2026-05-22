@@ -35,7 +35,7 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     let dir = session_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
-    let json = serde_json::to_string_pretty(session)?;
+    let json = serde_json::to_string(session)?;
     std::fs::write(path, json)?;
     Ok(())
 }
@@ -83,19 +83,28 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
+    // Sort by filesystem mtime to avoid loading all sessions
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|e| e == "json"))
+        .map(|e| {
+            let mtime = e.metadata().ok().and_then(|m| m.modified().ok());
+            let path = e.path();
+            (mtime, path)
+        })
+        .collect();
+
+    // Sort newest first
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+
     let mut sessions: Vec<Session> = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().is_some_and(|e| e == "json")
-            && let Ok(json) = std::fs::read_to_string(&path)
+    for (_, path) in entries.iter().take(limit) {
+        if let Ok(json) = std::fs::read_to_string(path)
             && let Ok(session) = serde_json::from_str::<Session>(&json)
         {
             sessions.push(session);
         }
     }
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    sessions.truncate(limit);
     Ok(sessions)
 }
 

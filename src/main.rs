@@ -13,6 +13,9 @@ mod ui;
 #[cfg(test)]
 mod tests;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 use session::MessageRole;
 
