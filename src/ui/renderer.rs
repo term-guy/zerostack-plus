@@ -2,9 +2,10 @@ use std::io::{self, Write};
 
 use compact_str::CompactString;
 use crossterm::ExecutableCommand;
-use crossterm::cursor::MoveTo;
-use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType, ScrollUp};
+use smallvec::{smallvec, SmallVec};
 
 use super::markdown::word_wrap;
 use super::resolve_color;
@@ -25,6 +26,9 @@ pub struct Renderer {
     scroll_offset: usize,
     input_scroll_offset: usize,
     monochrome: bool,
+    chat_bg: Option<Color>,
+    input_bg: Option<Color>,
+    status_bg: Option<Color>,
     pub selection_active: bool,
     pub selection_start: Option<usize>,
     pub selection_end: Option<usize>,
@@ -42,6 +46,9 @@ impl Renderer {
             scroll_offset: 0,
             input_scroll_offset: 0,
             monochrome: false,
+            chat_bg: None,
+            input_bg: None,
+            status_bg: None,
             selection_active: false,
             selection_start: None,
             selection_end: None,
@@ -50,6 +57,17 @@ impl Renderer {
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
+    }
+
+    pub fn set_background_colors(
+        &mut self,
+        chat_bg: Option<Color>,
+        input_bg: Option<Color>,
+        status_bg: Option<Color>,
+    ) {
+        self.chat_bg = chat_bg;
+        self.input_bg = input_bg;
+        self.status_bg = status_bg;
     }
 
     fn color(&self, color: Color) -> Color {
@@ -159,7 +177,7 @@ impl Renderer {
         }
     }
 
-    fn wrap_line(&self, line: &str, max_width: usize) -> Vec<CompactString> {
+    fn wrap_line(&self, line: &str, max_width: usize) -> SmallVec<[CompactString; 4]> {
         word_wrap(line, max_width)
     }
 
@@ -235,6 +253,7 @@ impl Renderer {
         let visible = rows.saturating_sub(2) as usize;
         let total = self.buffer.len();
         let mut stdout = io::stdout();
+        write!(stdout, "{}", Hide)?;
 
         let start = if self.scroll_offset == 0 {
             total.saturating_sub(visible)
@@ -253,7 +272,7 @@ impl Renderer {
             let wrapped = if text.chars().count() > max_width {
                 word_wrap(text, max_width)
             } else {
-                vec![text.clone()]
+                smallvec![text.clone()]
             };
 
             for chunk in &wrapped {
@@ -274,6 +293,9 @@ impl Renderer {
                         buf_idx >= lo && buf_idx <= hi
                     };
 
+                if let Some(bg) = self.chat_bg {
+                    write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+                }
                 if is_selected {
                     write!(stdout, "{}", SetAttribute(Attribute::Reverse))?;
                 }
@@ -282,8 +304,8 @@ impl Renderer {
                 if is_selected {
                     write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
                 }
-                write!(stdout, "{}", ResetColor)?;
                 write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
+                write!(stdout, "{}", ResetColor)?;
 
                 visual_row += 1;
             }
@@ -293,7 +315,11 @@ impl Renderer {
 
         while (visual_row as usize) < visible {
             stdout.execute(MoveTo(0, visual_row))?;
+            if let Some(bg) = self.chat_bg {
+                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+            }
             write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
+            write!(stdout, "{}", ResetColor)?;
             visual_row += 1;
         }
 
@@ -306,6 +332,9 @@ impl Renderer {
             let indicator = format!(" SCROLL {}% ", pct);
             let x = cols.saturating_sub(indicator.len() as u16);
             stdout.execute(MoveTo(x, 0))?;
+            if let Some(bg) = self.chat_bg {
+                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+            }
             write!(
                 stdout,
                 "{}",
@@ -334,7 +363,11 @@ impl Renderer {
             self.lines = self.lines.saturating_sub(1);
             for &r in &[max_content.saturating_sub(1), max_content] {
                 let _ = stdout.execute(MoveTo(0, r));
+                if let Some(bg) = self.chat_bg {
+                    let _ = write!(stdout, "{}", SetBackgroundColor(self.color(bg)));
+                }
                 let _ = write!(stdout, "{}", " ".repeat(cols as usize));
+                let _ = write!(stdout, "{}", ResetColor);
             }
             let _ = stdout.flush();
         }
@@ -368,7 +401,10 @@ impl Renderer {
                     let mut stdout = io::stdout();
                     let r = self.content_row();
                     stdout.execute(MoveTo(0, r))?;
-                    stdout.execute(Clear(ClearType::CurrentLine))?;
+                    if let Some(bg) = self.chat_bg {
+                        write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+                    }
+                    write!(stdout, "{}", Clear(ClearType::CurrentLine))?;
                     write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                     writeln!(stdout, "{}", chunk)?;
                     write!(stdout, "{}", ResetColor)?;
@@ -391,7 +427,7 @@ impl Renderer {
         if max_width == 0 {
             return Ok(());
         }
-        let parts: Vec<&str> = text.split('\n').collect();
+        let parts: SmallVec<[&str; 4]> = text.split('\n').collect();
         let last = parts.len() - 1;
         for (i, segment) in parts.iter().enumerate() {
             if i < last {
@@ -413,6 +449,9 @@ impl Renderer {
                     let mut stdout = io::stdout();
                     let r = self.content_row();
                     stdout.execute(MoveTo(self.col, r))?;
+                    if let Some(bg) = self.chat_bg {
+                        write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+                    }
                     if !segment.is_empty() {
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", segment)?;
@@ -423,7 +462,7 @@ impl Renderer {
                     self.col = 0;
                 }
             } else if !segment.is_empty() {
-                let chars: Vec<char> = segment.chars().collect();
+                let chars: SmallVec<[char; 64]> = segment.chars().collect();
                 let mut idx = 0;
                 while idx < chars.len() {
                     let avail = max_width.saturating_sub(self.col as usize);
@@ -456,9 +495,13 @@ impl Renderer {
                         let mut stdout = io::stdout();
                         let r = self.content_row();
                         stdout.execute(MoveTo(self.col, r))?;
+                        if let Some(bg) = self.chat_bg {
+                            write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+                        }
                         write!(stdout, "{}", SetForegroundColor(self.color(color)))?;
                         write!(stdout, "{}", chunk)?;
                         write!(stdout, "{}", ResetColor)?;
+
                         self.col = self.col.saturating_add(chunk.chars().count() as u16);
                     }
                     idx = end;
@@ -484,7 +527,11 @@ impl Renderer {
         self.scroll_offset = 0;
         self.clear_selection();
         let mut stdout = io::stdout();
+        if let Some(bg) = self.chat_bg {
+            write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+        }
         stdout.execute(Clear(ClearType::All))?;
+        write!(stdout, "{}", ResetColor)?;
         stdout.execute(MoveTo(0, 0))?;
         stdout.flush()?;
         self.lines = 0;
@@ -504,11 +551,11 @@ impl Renderer {
 
         let status_row = rows.saturating_sub(1);
 
-        let lines: Vec<&str> = input_line.split('\n').collect();
+        let lines: SmallVec<[&str; 4]> = input_line.split('\n').collect();
         let line_count = lines.len();
 
         let last_line = rows.saturating_sub(2) as usize - 1;
-        let available_rows = last_line + 1; // rows from 0 to last_line
+        let available_rows = last_line + 1;
         let need_scroll = line_count > available_rows;
         let first_visible = if need_scroll {
             line_count - available_rows
@@ -524,22 +571,9 @@ impl Renderer {
         };
         let prompt_width = prompt.chars().count();
 
-        // Clear input area
-        let visible_line_count = if need_scroll {
-            available_rows
-        } else {
-            line_count
-        };
-        for r in 0..visible_line_count {
-            let row = (rows.saturating_sub(2) - visible_line_count as u16 + 1) + r as u16;
-            let _ = stdout.execute(MoveTo(0, row));
-            let _ = write!(stdout, "{}", " ".repeat(cols as usize));
-        }
-
         let (cursor_line, cursor_col) =
             crate::ui::input::cursor_to_line_col(input_line, cursor_pos);
 
-        // Compute horizontal scroll for the cursor line
         let visible_width = cols.saturating_sub(prompt_width as u16) as usize;
         let cursor_line_text = lines.get(cursor_line).unwrap_or(&"");
         let cursor_line_len = cursor_line_text.chars().count();
@@ -556,6 +590,12 @@ impl Renderer {
             self.input_scroll_offset = 0;
         }
 
+        // Clear and draw input area
+        let visible_line_count = if need_scroll {
+            available_rows
+        } else {
+            line_count
+        };
         for (i, line) in lines
             .iter()
             .enumerate()
@@ -564,51 +604,65 @@ impl Renderer {
         {
             let render_row = (rows.saturating_sub(2) - visible_line_count as u16 + 1)
                 + (i - first_visible) as u16;
-            let _ = stdout.execute(MoveTo(0, render_row));
+            stdout.execute(MoveTo(0, render_row))?;
 
-            if i == first_visible {
-                let _ = write!(stdout, "{}", SetForegroundColor(self.color(Color::Cyan)));
-                let _ = write!(stdout, "{}", prompt);
-                let _ = write!(stdout, "{}", ResetColor);
-            } else {
-                let _ = write!(stdout, "{}", " ".repeat(prompt_width));
+            if let Some(bg) = self.input_bg {
+                write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
             }
 
-            let line_chars: Vec<char> = line.chars().collect();
+            if i == first_visible {
+                write!(stdout, "{}", SetForegroundColor(self.color(Color::Cyan)))?;
+                write!(stdout, "{}", prompt)?;
+                write!(stdout, "{}", SetForegroundColor(Color::Reset))?;
+            } else {
+                write!(stdout, "{}", " ".repeat(prompt_width))?;
+            }
+
+            let line_chars: SmallVec<[char; 64]> = line.chars().collect();
             let h_offset = if i == cursor_line { h_scroll } else { 0 };
             let display: String = line_chars
                 .iter()
                 .skip(h_offset)
                 .take(visible_width)
                 .collect();
-            let _ = write!(stdout, "{}", display);
+            write!(stdout, "{}", display)?;
+            write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
+            write!(stdout, "{}", ResetColor)?;
         }
 
         // Status line
-        let _ = stdout.execute(MoveTo(0, status_row));
-        let _ = write!(stdout, "{}", " ".repeat(cols as usize));
-        let _ = stdout.execute(MoveTo(0, status_row));
-        let _ = write!(
+        stdout.execute(MoveTo(0, status_row))?;
+        if let Some(bg) = self.status_bg {
+            write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+        }
+        write!(stdout, "{}", Clear(ClearType::CurrentLine))?;
+        stdout.execute(MoveTo(0, status_row))?;
+        if let Some(bg) = self.status_bg {
+            write!(stdout, "{}", SetBackgroundColor(self.color(bg)))?;
+        }
+        write!(
             stdout,
             "{}",
             SetForegroundColor(self.color(Color::DarkGrey))
-        );
+        )?;
         let status_display = if self.scroll_offset > 0 {
             format!("-- SCROLL -- {}", status)
         } else {
             status.to_string()
         };
         let truncated: String = status_display.chars().take(cols as usize).collect();
-        let _ = write!(stdout, "{}", truncated);
-        let _ = write!(stdout, "{}", ResetColor);
+        write!(stdout, "{}", truncated)?;
+        write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
+        write!(stdout, "{}", ResetColor)?;
 
         // Cursor
         let cursor_render_idx = cursor_line.saturating_sub(first_visible);
         let cursor_row =
             (rows.saturating_sub(2) - visible_line_count as u16 + 1) + cursor_render_idx as u16;
         let cursor_x = (prompt_width + cursor_col.saturating_sub(h_scroll)) as u16;
-        let _ = stdout.execute(MoveTo(cursor_x, cursor_row));
-        let _ = stdout.flush();
+        stdout.execute(MoveTo(cursor_x, cursor_row))?;
+        write!(stdout, "{}", Show)?;
+        stdout.flush()?;
         Ok(())
     }
 }
@@ -633,5 +687,82 @@ pub fn copy_to_clipboard(text: &str) {
             let _ = child.wait();
             return;
         }
+    }
+
+    // OSC 52 escape sequence — clipboard access via terminal emulator.
+    // Supported by Kitty, Alacritty, WezTerm, foot, iTerm2, Windows Terminal,
+    // and most other modern terminals. No external tools needed.
+    let encoded = base64_encode(text.as_bytes());
+    let mut stdout = std::io::stdout().lock();
+    let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+    let _ = stdout.flush();
+}
+
+/// Minimal base64 encoder — avoids pulling in a crate just for clipboard support.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) & 63] as char);
+        out.push(ALPHABET[(triple >> 12) & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(triple >> 6) & 63] } else { b'=' } as char);
+        out.push(if chunk.len() > 2 { ALPHABET[triple & 63] } else { b'=' } as char);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_encode_empty() {
+        assert_eq!(base64_encode(b""), "");
+    }
+
+    #[test]
+    fn base64_encode_single_byte() {
+        assert_eq!(base64_encode(b"f"), "Zg==");
+    }
+
+    #[test]
+    fn base64_encode_two_bytes() {
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+    }
+
+    #[test]
+    fn base64_encode_three_bytes() {
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn base64_encode_known_values() {
+        assert_eq!(base64_encode(b"Hello"), "SGVsbG8=");
+        assert_eq!(base64_encode(b"Hi!"), "SGkh");
+        assert_eq!(base64_encode(b"ab"), "YWI=");
+        assert_eq!(base64_encode(b"abc"), "YWJj");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+    }
+
+    #[test]
+    fn base64_encode_long_input() {
+        let input = "The quick brown fox jumps over the lazy dog. ".repeat(10);
+        let encoded = base64_encode(input.as_bytes());
+        assert!(encoded.len() > input.len());
+        assert!(encoded.ends_with('=') || !encoded.contains('='));
+    }
+
+    #[test]
+    fn copy_to_clipboard_does_not_panic() {
+        copy_to_clipboard("test text");
+    }
+
+    #[test]
+    fn copy_to_clipboard_empty_string() {
+        copy_to_clipboard("");
     }
 }

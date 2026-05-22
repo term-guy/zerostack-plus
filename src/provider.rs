@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use compact_str::CompactString;
 use rig::agent::Agent;
 use rig::client::CompletionClient;
 use rig::completion::{CompletionModel, Message};
@@ -46,7 +47,8 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
 pub struct ProviderInfo {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
-    pub api_key_env: Option<String>,
+    pub api_key_env: Option<CompactString>,
+    pub danger_accept_invalid_certs: bool,
 }
 
 pub fn resolve_provider_info(
@@ -54,11 +56,12 @@ pub fn resolve_provider_info(
     custom_providers: &HashMap<String, CustomProviderConfig>,
 ) -> Option<ProviderInfo> {
     if let Some(custom) = custom_providers.get(name) {
-        let kind = parse_provider(&custom.provider_type)?;
+        let kind = parse_provider(custom.provider_type.as_str())?;
         return Some(ProviderInfo {
             kind,
             base_url: Some(custom.base_url.clone()),
             api_key_env: custom.api_key_env.clone(),
+            danger_accept_invalid_certs: custom.danger_accept_invalid_certs.unwrap_or(false),
         });
     }
     let kind = parse_provider(name)?;
@@ -66,6 +69,7 @@ pub fn resolve_provider_info(
         kind,
         base_url: None,
         api_key_env: None,
+        danger_accept_invalid_certs: false,
     })
 }
 
@@ -321,23 +325,42 @@ pub fn create_client(
         }
     });
 
+    let http_client = if info.danger_accept_invalid_certs {
+        tracing::warn!(
+            "TLS certificate verification DISABLED for provider '{}' \
+             (danger_accept_invalid_certs = true). Connections are vulnerable to MITM.",
+            provider_name
+        );
+        reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()?
+    } else {
+        reqwest::Client::default()
+    };
+
     match info.kind {
         ProviderKind::OpenAI => {
-            let mut b = openai::CompletionsClient::builder().api_key(&key);
+            let mut b = openai::CompletionsClient::builder()
+                .api_key(&key)
+                .http_client(http_client.clone());
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
             Ok(AnyClient::OpenAI(b.build()?))
         }
         ProviderKind::Anthropic => {
-            let mut b = anthropic::Client::builder().api_key(&key);
+            let mut b = anthropic::Client::builder()
+                .api_key(&key)
+                .http_client(http_client.clone());
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
             Ok(AnyClient::Anthropic(b.build()?))
         }
         ProviderKind::Gemini => {
-            let mut b = gemini::Client::builder().api_key(&key);
+            let mut b = gemini::Client::builder()
+                .api_key(&key)
+                .http_client(http_client.clone());
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -345,14 +368,18 @@ pub fn create_client(
         }
         ProviderKind::Ollama => {
             let key: ollama::OllamaApiKey = key.as_str().into();
-            let mut b = ollama::Client::builder().api_key(key);
+            let mut b = ollama::Client::builder()
+                .api_key(key)
+                .http_client(http_client.clone());
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
             Ok(AnyClient::Ollama(b.build()?))
         }
         ProviderKind::OpenRouter => {
-            let mut b = openrouter::Client::builder().api_key(&key);
+            let mut b = openrouter::Client::builder()
+                .api_key(&key)
+                .http_client(http_client.clone());
             if let Some(base_url) = &base_url {
                 b = b.base_url(base_url);
             }
@@ -373,6 +400,7 @@ pub fn create_client(
             })?;
             let b = openai::CompletionsClient::builder()
                 .api_key(&key)
+                .http_client(http_client)
                 .base_url(&base_url);
             Ok(AnyClient::Custom(b.build()?))
         }

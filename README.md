@@ -42,7 +42,9 @@ cargo install --git https://github.com/term-guy/zerostack-plus --features acp
 cargo install --git https://github.com/term-guy/zerostack-plus --features "acp,loop,git-worktree,mcp"
 ```
 
-You are now ready to work with a lightweight coding agent!
+You are now ready to work with a lightweight coding agent! (You can also find pre-built binaries on Github Releases)
+
+*note:* If you have questions or you want to collaborate on the project, please join the [dedicated Matrix chatroom](https://app.element.io/#/room/#zerostack-general:matrix.org).
 
 ### Optional: sandbox mode
 
@@ -102,7 +104,8 @@ Built-in prompts:
 
 | Prompt                | Description                                                              |
 | --------------------- | ------------------------------------------------------------------------ |
-| **`code`** (default)  | Coding mode with full file and bash tool access, TDD workflow            |
+| **`code`** (default)  | Coding mode with full file and bash tool access                          |
+| **`code-tdd`**        | Coding mode with full file and bash tool access, TDD workflow            |
 | **`plan`**            | Planning-only mode — explores and produces a plan without writing code   |
 | **`review`**          | Code review mode — reviews for correctness, design, testing, and impact  |
 | **`debug`**           | Debug mode — finds root cause before proposing fixes                     |
@@ -242,7 +245,7 @@ zerostack --acp --acp-host 0.0.0.0 --acp-port 7243
 
 ### ACP config
 
-In `$XDG_CONFIG_HOME/zerostack/config.json`:
+In `~/.local/share/zerostack/config.json`:
 
 ```json
 {
