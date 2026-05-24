@@ -6,11 +6,12 @@ use compact_str::CompactString;
 use crate::config::{Config, QuickModelConfig};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::McpServerConfig;
+use crate::fs::expand_tilde;
 use crate::session::storage;
 
 fn resolve_config_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("ZS_CONFIG_DIR") {
-        let dir = PathBuf::from(dir);
+        let dir = PathBuf::from(expand_tilde(&dir.to_string_lossy()));
         let toml = dir.join("config.toml");
         let json = dir.join("config.json");
         if toml.exists() {

@@ -19,7 +19,7 @@ pub fn expand_tilde(s: &str) -> String {
             let user = &rest[..slash_pos];
             let path_after = &rest[slash_pos + 1..];
             if let Some(user_entry) = users::get_user_by_name(user) {
-                let home = user_entry.home_dir();
+                let home: &Path = user_entry.home_dir();
                 return Path::new(home)
                     .join(path_after)
                     .to_string_lossy()

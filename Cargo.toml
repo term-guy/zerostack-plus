@@ -44,6 +44,7 @@ thiserror = "2"
 futures = "0.3"
 reqwest = "0.13"
 dirs = "6"
+users = "0.11"
 compact_str = { version = "0.9", features = ["serde"] }
 smallvec = "1"
 regex = "1"
