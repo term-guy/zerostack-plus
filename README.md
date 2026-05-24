@@ -22,9 +22,9 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 
 _zerostack-plus_ is one of the smallest and most performant coding agents on the market.
 
-- Lines of code: ~9k LoC
-- Binary size: 8.9MB
-- RAM footprint: ~10MB on an empty session, ~13MB when working (vs ~300MB for opencode or other JS-based coding agents)
+- Lines of code: ~12k LoC
+- Binary size: 12.9MB
+- RAM footprint: ~16MB on average, with peaks at ~24MB (vs ~300MB with peaks at ~700MB for opencode or other JS-based coding agents)
 - CPU usage: 0.0% on idle, ~1.5% when using tools (measured on an Intel i5 7th gen, vs ~2% on idle and ~20% when working for opencode)
 
 ## Installation
@@ -43,6 +43,8 @@ cargo install --git https://github.com/term-guy/zerostack-plus --features "acp,l
 ```
 
 You are now ready to work with a lightweight coding agent! (You can also find pre-built binaries on Github Releases)
+
+Once installed, run `/prompt autoconfig` inside zerostack to explore the documentation and configure the tool interactively.
 
 *note:* If you have questions or you want to collaborate on the project, please join the [dedicated Matrix chatroom](https://app.element.io/#/room/#zerostack-general:matrix.org).
 
@@ -91,8 +93,10 @@ zerostack --provider deepseek --model deepseek-v4-flash
 
 ## Configuration
 
-See [CONFIG.md](CONFIG.md) for config file location, accepted keys, provider
+See [docs/CONFIG.md](docs/CONFIG.md) for config file location, accepted keys, provider
 aliases, permission rules, and MCP server configuration.
+
+You can run `/prompt autoconfig` in order to use a specialized agent that allows to navigate the documentation and customize your zerostack setup.
 
 ## Prompts system
 

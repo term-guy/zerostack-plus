@@ -1,19 +1,21 @@
 mod cmd_picker;
+mod event_handler;
 mod events;
 pub(crate) mod input;
 mod markdown;
+mod permission_handler;
 pub(crate) mod picker;
 pub(crate) mod renderer;
 mod slash;
 mod status;
 mod terminal;
+pub(crate) mod utils;
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use compact_str::CompactString;
 use crossterm::event;
 use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::style::Color;
@@ -25,120 +27,26 @@ use crate::context::ContextFiles;
 use crate::event::{AgentEvent, UserEvent};
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
-use crate::permission::ask::{AskReceiver, AskSender, UserDecision};
+use crate::permission::ask::{AskReceiver, AskSender};
 use crate::permission::checker::PermCheck;
 use crate::provider::{AnyAgent, AnyClient};
 use crate::sandbox::Sandbox;
-use crate::session::{MessageRole, PermissionAllowEntry, Session};
+use crate::session::{MessageRole, Session};
+use crate::ui::event_handler::{ensure_agent, handle_agent_event};
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
+use crate::ui::permission_handler::handle_permission_request;
 use crate::ui::renderer::{Renderer, copy_to_clipboard};
 use crate::ui::slash::{handle_compress, handle_slash};
 use crate::ui::status::StatusLine;
 use crate::ui::terminal::TerminalGuard;
 
-const C_AGENT: Color = Color::White;
-const C_ERROR: Color = Color::Red;
-const C_TOOL: Color = Color::Yellow;
-const C_PERM: Color = Color::Magenta;
+use self::utils::parse_color;
 
-#[inline]
-pub(crate) fn resolve_color(color: Color, monochrome: bool) -> Color {
-    if monochrome {
-        let _ = color;
-        Color::Reset
-    } else {
-        color
-    }
-}
-
-pub(crate) fn parse_color(s: &str) -> Option<Color> {
-    let s = s.trim().to_lowercase();
-    match s.as_str() {
-        "reset" => Some(Color::Reset),
-        "black" => Some(Color::Black),
-        "dark_grey" | "darkgrey" | "dark_gray" | "darkgray" => Some(Color::DarkGrey),
-        "red" => Some(Color::Red),
-        "dark_red" | "darkred" => Some(Color::DarkRed),
-        "green" => Some(Color::Green),
-        "dark_green" | "darkgreen" => Some(Color::DarkGreen),
-        "yellow" => Some(Color::Yellow),
-        "dark_yellow" | "darkyellow" => Some(Color::DarkYellow),
-        "blue" => Some(Color::Blue),
-        "dark_blue" | "darkblue" => Some(Color::DarkBlue),
-        "magenta" => Some(Color::Magenta),
-        "dark_magenta" | "darkmagenta" => Some(Color::DarkMagenta),
-        "cyan" => Some(Color::Cyan),
-        "dark_cyan" | "darkcyan" => Some(Color::DarkCyan),
-        "white" => Some(Color::White),
-        "grey" | "gray" => Some(Color::Grey),
-        _ => {
-            if let Some(hex) = s.strip_prefix('#') {
-                if hex.len() == 6 {
-                    if let (Ok(r), Ok(g), Ok(b)) = (
-                        u8::from_str_radix(&hex[0..2], 16),
-                        u8::from_str_radix(&hex[2..4], 16),
-                        u8::from_str_radix(&hex[4..6], 16),
-                    ) {
-                        return Some(Color::Rgb { r, g, b });
-                    }
-                }
-            }
-            None
-        }
-    }
-}
-
-/// Formats a tool call showing only the primary file/command parameter.
-/// - read/write/edit → path
-/// - grep → pattern (and path if both present)
-/// - find_files → pattern
-/// - list_dir → path
-/// - bash → command (truncated to 60 chars)
-/// - others → first string arg or nothing
-fn format_tool_call_summary(name: &str, args: &serde_json::Value) -> String {
-    let obj = match args {
-        serde_json::Value::Object(map) => map,
-        _ => return name.to_string(),
-    };
-
-    // Determine which key(s) to show based on tool name
-    let primary_keys: &[&str] = match name {
-        "read" | "write" | "edit" | "list_dir" => &["path"],
-        "grep" => &["pattern", "path"],
-        "find_files" => &["pattern"],
-        "bash" => &["command"],
-        _ => &[],
-    };
-
-    let mut shown = Vec::new();
-    for key in primary_keys {
-        if let Some(serde_json::Value::String(val)) = obj.get(*key) {
-            let truncated = if val.len() > 60 {
-                format!("\"{}...\"", &val[..57])
-            } else {
-                format!("\"{}\"", val)
-            };
-            shown.push(truncated);
-        }
-    }
-
-    if shown.is_empty() {
-        // fallback: show first string value if any
-        if let Some((_, serde_json::Value::String(val))) = obj.iter().next() {
-            let truncated = if val.len() > 60 {
-                format!("\"{}...\"", &val[..57])
-            } else {
-                format!("\"{}\"", val)
-            };
-            format!("{} {}", name, truncated)
-        } else {
-            name.to_string()
-        }
-    } else {
-        format!("{} {}", name, shown.join(" "))
-    }
-}
+pub(super) const C_AGENT: Color = Color::White;
+pub(super) const C_ERROR: Color = Color::Red;
+pub(super) const C_TOOL: Color = Color::Yellow;
+pub(super) const C_PERM: Color = Color::Magenta;
 
 fn refresh_display(
     renderer: &mut Renderer,
@@ -207,6 +115,9 @@ fn spawn_event_thread(
                     Ok(event::Event::Resize(cols, rows)) => {
                         let _ = user_tx.blocking_send(UserEvent::Resize(cols, rows));
                     }
+                    Ok(event::Event::Paste(data)) => {
+                        let _ = user_tx.blocking_send(UserEvent::Paste(data));
+                    }
                     Err(_) => break,
                     _ => {}
                 }
@@ -215,51 +126,18 @@ fn spawn_event_thread(
     })
 }
 
+/// Lazily initialise the MCP client manager (connects only on first use).
 #[cfg(feature = "mcp")]
-async fn ensure_agent(
-    agent: &mut Option<AnyAgent>,
-    client: &AnyClient,
-    session: &Session,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    sandbox: &Sandbox,
-    reasoning_enabled: bool,
-    mcp_manager: Option<&McpClientManager>,
-) {
-    if agent.is_some() {
-        return;
+async fn ensure_mcp_manager<'a>(
+    mcp: &'a mut Option<McpClientManager>,
+    cfg: &'a Config,
+) -> Option<&'a McpClientManager> {
+    if mcp.is_none() {
+        if let Some(servers) = &cfg.mcp_servers {
+            *mcp = Some(McpClientManager::connect_all(servers).await);
+        }
     }
-    let model = client.completion_model(session.model.to_string());
-    *agent = Some(crate::provider::build_agent(
-        model, cli, cfg, context, permission.clone(), ask_tx.clone(),
-        sandbox.clone(), reasoning_enabled, mcp_manager,
-    ).await);
-}
-
-#[cfg(not(feature = "mcp"))]
-async fn ensure_agent(
-    agent: &mut Option<AnyAgent>,
-    client: &AnyClient,
-    session: &Session,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    sandbox: &Sandbox,
-    reasoning_enabled: bool,
-) {
-    if agent.is_some() {
-        return;
-    }
-    let model = client.completion_model(session.model.to_string());
-    *agent = Some(crate::provider::build_agent(
-        model, cli, cfg, context, permission.clone(), ask_tx.clone(),
-        sandbox.clone(), reasoning_enabled,
-    ).await);
+    mcp.as_ref()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -274,13 +152,19 @@ pub async fn run_interactive(
     ask_tx: Option<AskSender>,
     mut ask_rx: Option<AskReceiver>,
     sandbox: Sandbox,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> anyhow::Result<()> {
     let _guard = TerminalGuard::new()?;
 
+    #[cfg(feature = "mcp")]
+    let mut mcp_manager: Option<McpClientManager> = None;
+
     let mut renderer = Renderer::new()?;
     renderer.set_monochrome(cli.no_color);
-    if let Some(colors) = &cfg.colors {
+    if let Some(ref theme_name) = context.current_theme_name {
+        if let Some(content) = context.themes.get(theme_name.as_str()) {
+            crate::context::themes::apply(content, &mut renderer);
+        }
+    } else if let Some(colors) = &cfg.colors {
         let chat_bg = colors.chat_background.as_deref().and_then(parse_color);
         let input_bg = colors.input_background.as_deref().and_then(parse_color);
         let status_bg = colors.status_background.as_deref().and_then(parse_color);
@@ -336,6 +220,76 @@ pub async fn run_interactive(
         perm_mode().as_deref(),
     )?;
 
+    #[cfg(feature = "git-worktree")]
+    if let Some(name) = &cli.worktree {
+        match crate::extras::git_worktree::create(name) {
+            Ok((path, _info)) => {
+                std::env::set_current_dir(&path).ok();
+                session.working_dir = compact_str::CompactString::new(path.to_string_lossy());
+                context.reload();
+                #[cfg(feature = "mcp")]
+                let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
+                let model = client.completion_model(session.model.to_string());
+                agent = Some(
+                    crate::provider::build_agent(
+                        model,
+                        cli,
+                        cfg,
+                        context,
+                        permission.clone(),
+                        ask_tx.clone(),
+                        sandbox.clone(),
+                        reasoning_enabled,
+                        #[cfg(feature = "mcp")]
+                        mcp_ref,
+                    )
+                    .await,
+                );
+                let _ = render_session(&mut renderer, session, cli, cfg, context);
+            }
+            Err(e) => {
+                let _ = renderer.write_line(&format!("worktree failed: {}", e), C_ERROR);
+            }
+        }
+    }
+    #[cfg(feature = "git-worktree")]
+    if cli.parallel {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = ts.to_string();
+        match crate::extras::git_worktree::create(&name) {
+            Ok((path, _info)) => {
+                std::env::set_current_dir(&path).ok();
+                session.working_dir = compact_str::CompactString::new(path.to_string_lossy());
+                context.reload();
+                #[cfg(feature = "mcp")]
+                let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
+                let model = client.completion_model(session.model.to_string());
+                agent = Some(
+                    crate::provider::build_agent(
+                        model,
+                        cli,
+                        cfg,
+                        context,
+                        permission.clone(),
+                        ask_tx.clone(),
+                        sandbox.clone(),
+                        reasoning_enabled,
+                        #[cfg(feature = "mcp")]
+                        mcp_ref,
+                    )
+                    .await,
+                );
+                let _ = render_session(&mut renderer, session, cli, cfg, context);
+            }
+            Err(e) => {
+                let _ = renderer.write_line(&format!("worktree failed: {}", e), C_ERROR);
+            }
+        }
+    }
+
     let (mut user_tx, mut user_rx) = mpsc::channel::<UserEvent>(64);
     let mut running = Arc::new(AtomicBool::new(true));
     let mut event_handle = Some(spawn_event_thread(user_tx.clone(), running.clone()));
@@ -389,6 +343,11 @@ pub async fn run_interactive(
                             renderer.clear_selection();
                             refresh_display(&mut renderer, &input, session, is_running, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref())?;
                         }
+                        continue;
+                    }
+                    UserEvent::Paste(data) => {
+                        input.handle_paste(data);
+                        refresh_display(&mut renderer, &input, session, is_running, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref())?;
                         continue;
                     }
                     UserEvent::Key(key) => {
@@ -501,7 +460,9 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("> {}", safe_line), Color::Green)?;
                                 }
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &mut client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut reasoning_enabled, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager).await;
+                                #[cfg(feature = "mcp")]
+                                let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
+                                let result = handle_slash(&text, &mut agent, &mut client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut reasoning_enabled, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_ref).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -509,12 +470,14 @@ pub async fn run_interactive(
                                         let s = s.trim();
                                         if s.is_empty() || s == "(none)" { None } else { Some(s.to_string()) }
                                     });
+                                        #[cfg(feature = "mcp")]
+                                        let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
                                         let compress_result = handle_compress(
                                             instructions.as_deref(),
                                             &mut agent, &mut client, &mut renderer, session, cli, cfg, context,
                                             reasoning_enabled,
                                             &permission, &ask_tx, &sandbox,
-                                            #[cfg(feature = "mcp")] mcp_manager,
+                                            #[cfg(feature = "mcp")] mcp_ref,
                                         ).await;
                                         if let Err(e) = compress_result {
                                             renderer.write_line(&format!("compress error: {}", e), C_ERROR)?;
@@ -540,10 +503,12 @@ pub async fn run_interactive(
                                             );
                                             session.add_message(MessageRole::User, &prompt);
                                             let history = crate::agent::runner::convert_history(session);
+                                            #[cfg(feature = "mcp")]
+                                            let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
                                             ensure_agent(
                                                 &mut agent, &client, session, cli, cfg, context,
                                                 &permission, &ask_tx, &sandbox, reasoning_enabled,
-                                                #[cfg(feature = "mcp")] mcp_manager,
+                                                #[cfg(feature = "mcp")] mcp_ref,
                                             ).await;
                                             let runner = agent.as_ref().unwrap().clone().spawn_runner(prompt, history);
                                             agent_rx = Some(runner.event_rx);
@@ -561,6 +526,8 @@ pub async fn run_interactive(
                                                 .map_err(|e| anyhow::anyhow!("failed to change directory: {}", e))?;
                                             session.working_dir = compact_str::CompactString::new(main_path);
                                             context.reload();
+                                            #[cfg(feature = "mcp")]
+                                            let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
                                             let model = client.completion_model(session.model.to_string());
                                             agent = Some(crate::provider::build_agent(
                                                 model,
@@ -571,7 +538,7 @@ pub async fn run_interactive(
                                                 ask_tx.clone(),
                                                 sandbox.clone(),
                                                 reasoning_enabled,
-                                                #[cfg(feature = "mcp")] mcp_manager,
+                                                #[cfg(feature = "mcp")] mcp_ref,
                                             ).await);
                                             render_session(&mut renderer, session, cli, cfg, context)?;
                                             renderer.write_line(
@@ -601,10 +568,12 @@ pub async fn run_interactive(
                                         {
                                             ls.iteration = 1;
                                             let prompt = ls.build_prompt();
+                                            #[cfg(feature = "mcp")]
+                                            let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
                                             ensure_agent(
                                                 &mut agent, &client, session, cli, cfg, context,
                                                 &permission, &ask_tx, &sandbox, reasoning_enabled,
-                                                #[cfg(feature = "mcp")] mcp_manager,
+                                                #[cfg(feature = "mcp")] mcp_ref,
                                             ).await;
                                             let runner = agent.as_ref().unwrap().clone().spawn_runner(prompt, Vec::new());
                                             agent_rx = Some(runner.event_rx);
@@ -628,10 +597,12 @@ pub async fn run_interactive(
                                 }
                                 renderer.write_line("", Color::White)?;
 
+                                #[cfg(feature = "mcp")]
+                                let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
                                 ensure_agent(
                                     &mut agent, &client, session, cli, cfg, context,
                                     &permission, &ask_tx, &sandbox, reasoning_enabled,
-                                    #[cfg(feature = "mcp")] mcp_manager,
+                                    #[cfg(feature = "mcp")] mcp_ref,
                                 ).await;
                                 let history = crate::agent::runner::convert_history(session);
                                 let runner = agent.as_ref().unwrap().clone().spawn_runner(
@@ -665,298 +636,30 @@ pub async fn run_interactive(
                 }
             }
             Some(event) = async {
-                if let Some(rx) = &mut agent_rx {
-                    rx.recv().await
-                } else {
-                    std::future::pending().await
-                }
+                agent_rx.as_mut()?.recv().await
             } => {
-                match event {
-                    AgentEvent::Reasoning(text) => {
-                        if !show_reasoning {
-                            continue;
-                        }
-                        if !agent_line_started {
-                            renderer.write("< ", Color::DarkMagenta)?;
-                            agent_line_started = true;
-                        }
-                        let safe = sanitize_output(&text);
-                        renderer.write(&safe, Color::DarkMagenta)?;
-                        was_reasoning = true;
-                    }
-                    AgentEvent::Token(text) => {
-                        if was_reasoning {
-                            renderer.write_line("", Color::White)?;
-                            agent_line_started = false;
-                            was_reasoning = false;
-                            response_buf.clear();
-                            response_start_line = None;
-                        }
-                        let safe = sanitize_output(&text);
-                        response_buf.push_str(&safe);
-
-                        if response_buf.is_empty() {
-                            continue;
-                        }
-
-                        let max_width = renderer.line_width();
-                        let mut styled =
-                            crate::ui::markdown::markdown_to_styled(&response_buf, max_width);
-
-                        if !styled.is_empty() {
-                            styled[0].text =
-                                CompactString::from(format!("< {}", styled[0].text));
-                        }
-
-                        if let Some(start) = response_start_line {
-                            renderer.replace_from(start, styled);
-                        } else {
-                            let start = renderer.buffer_len();
-                            response_start_line = Some(start);
-                            renderer.replace_from(start, styled);
-                        }
-                        renderer.render_viewport()?;
-                        agent_line_started = true;
-                    }
-                    AgentEvent::ToolCall { name, args } => {
-                        was_reasoning = false;
-                        if agent_line_started {
-                            renderer.write_line("", Color::White)?;
-                            agent_line_started = false;
-                        }
-                        response_buf.clear();
-                        response_start_line = None;
-                        let line = format!("◈ {}", format_tool_call_summary(&name, &args));
-                        renderer.write_line(&sanitize_output(&line), C_TOOL)?;
-                    }
-                    AgentEvent::ToolResult { output } => {
-                        let show_details = cfg.show_tool_details.unwrap_or(false);
-                        if show_details {
-                            let sanitized = sanitize_output(&output);
-                            let char_count = sanitized.chars().count();
-                            let preview: String = sanitized.chars().take(120).collect();
-                            let preview_trimmed = if char_count > 120 {
-                                format!("{}...", preview)
-                            } else {
-                                preview
-                            };
-                            let summary = if char_count > 120 {
-                                format!("◈ result ({} chars): {}", char_count, preview_trimmed)
-                            } else {
-                                preview_trimmed
-                            };
-                            renderer.write_line(&summary, Color::DarkGrey)?;
-                        }
-                    }
-                    AgentEvent::Done { response, tokens, cost } => {
-                        was_reasoning = false;
-
-                        if !response_buf.is_empty() {
-                            let max_width = renderer.line_width();
-                            let mut styled = crate::ui::markdown::markdown_to_styled(
-                                &response_buf,
-                                max_width,
-                            );
-                            if !styled.is_empty() {
-                                styled[0].text =
-                                    CompactString::from(format!("< {}", styled[0].text));
-                            }
-                            if let Some(start) = response_start_line {
-                                renderer.replace_from(start, styled);
-                                renderer.render_viewport()?;
-                            }
-                        } else if !agent_line_started {
-                            renderer.write("< ", C_AGENT)?;
-                        }
-
-                        renderer.write_line("", Color::White)?;
-                        renderer.write_line("", Color::White)?;
-                        session.add_message(MessageRole::Assistant, &response);
-                        session.total_tokens = session.total_tokens.saturating_add(tokens);
-                        session.total_cost += cost;
-                        agent_line_started = false;
-                        response_buf.clear();
-                        response_start_line = None;
-
-                        #[cfg(feature = "loop")]
-                        let loop_running = loop_state.as_ref().is_some_and(|ls| ls.active);
-                        #[cfg(not(feature = "loop"))]
-                        let loop_running = false;
-
-                        if !loop_running
-                            && cfg.resolve_compact_enabled()
-                            && session.needs_compaction(cfg.resolve_reserve_tokens())
-                            && !cli.no_session
-                        {
-                            renderer.write_line("auto-compacting...", Color::DarkGrey)?;
-                            let compress_result = handle_compress(
-                                None,
-                                &mut agent, &mut client, &mut renderer, session, cli, cfg, context,
-                                reasoning_enabled,
-                                &permission, &ask_tx, &sandbox,
-                                #[cfg(feature = "mcp")] mcp_manager,
-                            ).await;
-                            if let Err(e) = compress_result {
-                                renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
-                            }
-                        }
-
-                        if !cli.no_session
-                            && let Err(e) = crate::session::storage::save_session(session)
-                        {
-                            renderer.write_line(
-                                &format!("warning: failed to save session: {}", e),
-                                C_ERROR,
-                            )?;
-                        }
-                        is_running = false;
-                        agent_rx = None;
-
-                        #[cfg(feature = "loop")]
-                        if let Some(ref mut ls) = loop_state
-                            && ls.active
-                        {
-                            if ls.should_stop() {
-                                renderer.write_line(
-                                    &format!(
-                                        "[loop] max iterations ({}) reached, stopping",
-                                        ls.iteration
-                                    ),
-                                    C_AGENT,
-                                )?;
-                                ls.active = false;
-                                loop_label = None;
-                            } else {
-                                let summary: String = response.chars().take(200).collect();
-                                ls.last_summary = Some(summary);
-                                ls.iteration += 1;
-                                let prompt = ls.build_prompt();
-                                ensure_agent(
-                                    &mut agent, &client, session, cli, cfg, context,
-                                    &permission, &ask_tx, &sandbox, reasoning_enabled,
-                                    #[cfg(feature = "mcp")] mcp_manager,
-                                ).await;
-                                let runner = agent.as_ref().unwrap().clone().spawn_runner(prompt, Vec::new());
-                                agent_rx = Some(runner.event_rx);
-                                is_running = true;
-                                loop_label = Some(ls.iteration_label());
-                                renderer.write_line(
-                                    &format!("[loop] launching {}", ls.iteration_label()),
-                                    C_AGENT,
-                                )?;
-                            }
-                        }
-
-                        #[cfg(feature = "git-worktree")]
-                        if let Some(main_path) = wt_return_path.take() {
-                            match std::env::set_current_dir(&main_path) {
-                                Ok(()) => {
-                                    session.working_dir = compact_str::CompactString::new(&main_path);
-                                    context.reload();
-                                    let model = client.completion_model(session.model.to_string());
-                                    agent = Some(crate::provider::build_agent(
-                                        model,
-                                        cli,
-                                        cfg,
-                                        context,
-                                        permission.clone(),
-                                        ask_tx.clone(),
-                                        sandbox.clone(),
-                                        reasoning_enabled,
-                                        #[cfg(feature = "mcp")] mcp_manager,
-                                    ).await);
-                                    render_session(&mut renderer, session, cli, cfg, context)?;
-                                    renderer.write_line(
-                                        &format!("merged and returned to main repo at {}", main_path),
-                                        C_AGENT,
-                                    )?;
-                                }
-                                Err(e) => {
-                                    renderer.write_line(
-                                        &format!("warning: failed to change back to main repo: {}", e),
-                                        C_ERROR,
-                                    )?;
-                                }
-                            }
-                        }
-                    }
-                    AgentEvent::Error(e) => {
-                        was_reasoning = false;
-                        let safe = sanitize_output(&e);
-                        renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
-                        is_running = false;
-                        agent_rx = None;
-                        agent_line_started = false;
-                        response_buf.clear();
-                        response_start_line = None;
-                    }
-                }
+                #[cfg(feature = "mcp")]
+                let mcp_ref = ensure_mcp_manager(&mut mcp_manager, cfg).await;
+                handle_agent_event(
+                    event, &mut renderer, session, cfg, cli, context,
+                    &mut is_running, &mut agent_rx, &mut agent_line_started,
+                    &mut response_buf, &mut response_start_line, &mut was_reasoning,
+                    show_reasoning,
+                    &mut agent, &mut client, &mut loop_label,
+                    &permission, &ask_tx, &sandbox,
+                    #[cfg(feature = "loop")] &mut loop_state,
+                    #[cfg(feature = "git-worktree")] &mut wt_return_path,
+                    #[cfg(feature = "mcp")] mcp_ref,
+                ).await?;
                 refresh_display(&mut renderer, &input, session, is_running, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref())?;
             }
             Some(ask_req) = async {
-                if let Some(rx) = &mut ask_rx {
-                    rx.recv().await
-                } else {
-                    std::future::pending().await
-                }
+                ask_rx.as_mut()?.recv().await
             } => {
-                was_reasoning = false;
-                if agent_line_started {
-                    renderer.write_line("", Color::White)?;
-                    agent_line_started = false;
-                }
-
-                renderer.write_line(
-                    &format!("[permission] {}: {}", ask_req.tool, ask_req.input),
-                    C_PERM,
-                )?;
-                renderer.write_line(
-                    "  (y) allow once  (a) allow always  (n) deny  (ESC) abort",
-                    C_PERM,
-                )?;
-
-                let decision = loop {
-                    tokio::select! {
-                        Some(ev) = user_rx.recv() => {
-                            if let UserEvent::Key(key) = ev {
-                                match key.code {
-                                    KeyCode::Char('y') => break UserDecision::AllowOnce,
-                                    KeyCode::Char('a') => {
-                                        let pattern = suggest_pattern(&ask_req.tool, &ask_req.input);
-                                        renderer.write_line(
-                                            &format!("  -> will allow: {}", pattern),
-                                            Color::Green,
-                                        )?;
-                                        break UserDecision::AllowAlways(pattern);
-                                    }
-                                    KeyCode::Char('n') | KeyCode::Esc => break UserDecision::Deny,
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                };
-
-                let allow_pattern = match &decision {
-                    UserDecision::AllowAlways(p) => Some(p.clone()),
-                    _ => None,
-                };
-                let _ = ask_req.reply.send(decision);
-
-                if let Some(pattern) = allow_pattern {
-                    renderer.write_line(
-                        &format!("  allowed {} {} (saved to session)", ask_req.tool, pattern),
-                        Color::Green,
-                    )?;
-                    session.permission_allowlist.push(PermissionAllowEntry {
-                        tool: ask_req.tool.clone(),
-                        pattern: pattern.into(),
-                    });
-                    if !cli.no_session {
-                        let _ = crate::session::storage::save_session(session);
-                    }
-                }
-
+                handle_permission_request(
+                    ask_req, &mut renderer, session, cli,
+                    &mut user_rx, &mut agent_line_started, &mut was_reasoning,
+                ).await?;
                 refresh_display(&mut renderer, &input, session, is_running, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref())?;
             }
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)), if is_running => {
@@ -968,31 +671,19 @@ pub async fn run_interactive(
         }
     }
 
-    Ok(())
-}
-
-fn suggest_pattern(tool: &str, input: &str) -> String {
-    match tool {
-        "bash" => {
-            let first = input.split_whitespace().next().unwrap_or("*");
-            format!("{} *", first)
-        }
-        "read" | "write" | "edit" | "list_dir" => {
-            let path = std::path::Path::new(input);
-            let parent = path
-                .parent()
-                .map(|p| p.to_string_lossy())
-                .unwrap_or(std::borrow::Cow::Borrowed("*"));
-            if parent.is_empty() {
-                "**".to_string()
-            } else {
-                format!("{}/*", parent)
-            }
-        }
-        "grep" | "find_files" => {
-            let first = input.split_whitespace().next().unwrap_or("*");
-            format!("{}*", first)
-        }
-        _ => "*".to_string(),
+    #[cfg(feature = "git-worktree")]
+    if cli.resolve_wt_auto_merge(cfg)
+        && let Some(info) = crate::extras::git_worktree::detect()
+    {
+        let target = crate::extras::git_worktree::default_branch(&info.main_repo_path)
+            .unwrap_or_else(|| "main".to_string());
+        let _ = crate::extras::git_worktree::merge(&info, &target);
     }
+
+    #[cfg(feature = "mcp")]
+    if let Some(mgr) = mcp_manager {
+        mgr.shutdown().await;
+    }
+
+    Ok(())
 }

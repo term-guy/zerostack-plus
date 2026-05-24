@@ -136,6 +136,21 @@ pub struct Cli {
     )]
     pub loop_run: Option<String>,
 
+    #[cfg(feature = "git-worktree")]
+    #[arg(long = "worktree", help = "Create a git worktree and cd into it")]
+    pub worktree: Option<String>,
+
+    #[cfg(feature = "git-worktree")]
+    #[arg(long = "wt-auto-merge", help = "Auto-merge worktree branch on exit")]
+    pub wt_auto_merge: bool,
+
+    #[cfg(feature = "git-worktree")]
+    #[arg(
+        long = "parallel",
+        help = "Create a worktree with timestamp name and auto-merge on exit"
+    )]
+    pub parallel: bool,
+
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
 }
@@ -146,9 +161,7 @@ impl Cli {
         cfg: &'a config::Config,
     ) -> Option<&'a config::QuickModelConfig> {
         let name = self.quick_model.as_deref()?;
-        cfg.quick_models
-            .as_ref()
-            .and_then(|m| m.get(name))
+        cfg.quick_models.as_ref().and_then(|m| m.get(name))
     }
 
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
@@ -192,5 +205,10 @@ impl Cli {
             .clone()
             .or_else(|| cfg.shell.clone())
             .unwrap_or_else(|| "bash".to_string())
+    }
+
+    #[cfg(feature = "git-worktree")]
+    pub fn resolve_wt_auto_merge(&self, cfg: &config::Config) -> bool {
+        self.wt_auto_merge || self.parallel || cfg.wt_auto_merge.unwrap_or(false)
     }
 }

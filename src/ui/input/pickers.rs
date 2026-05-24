@@ -1,44 +1,9 @@
-use std::io::Write;
-
 use compact_str::CompactString;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::ui::cmd_picker::{CommandPicker, ModelsPicker, PromptPicker, ThemePicker};
+use crate::ui::input::cursor::prev_char_boundary;
 use crate::ui::picker::FilePicker;
-
-fn prev_char_boundary(s: &str, idx: usize) -> usize {
-    let mut i = idx.saturating_sub(1);
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn next_char_boundary(s: &str, idx: usize) -> usize {
-    let len = s.len();
-    let mut i = (idx + 1).min(len);
-    while i < len && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-pub fn cursor_to_line_col(buffer: &str, cursor: usize) -> (usize, usize) {
-    let mut line = 0usize;
-    let mut col = 0usize;
-    for (i, ch) in buffer.char_indices() {
-        if i >= cursor {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
 
 pub enum Picker {
     File(FilePicker),
@@ -80,370 +45,7 @@ impl Picker {
     }
 }
 
-pub struct InputEditor {
-    pub buffer: CompactString,
-    pub cursor: usize,
-    history: Vec<CompactString>,
-    history_pos: Option<usize>,
-    pub picker: Option<Picker>,
-    monochrome: bool,
-    prompt_names: Vec<String>,
-    theme_names: Vec<String>,
-    quick_model_names: Vec<String>,
-    editor: Option<String>,
-}
-
-impl InputEditor {
-    pub fn new() -> Self {
-        InputEditor {
-            buffer: CompactString::new(""),
-            cursor: 0,
-            history: Vec::new(),
-            history_pos: None,
-            picker: None,
-            monochrome: false,
-            prompt_names: Vec::new(),
-            theme_names: Vec::new(),
-            quick_model_names: Vec::new(),
-            editor: None,
-        }
-    }
-
-    pub fn set_quick_model_names(&mut self, names: Vec<String>) {
-        self.quick_model_names = names;
-    }
-
-    pub fn set_editor(&mut self, editor: String) {
-        self.editor = Some(editor);
-    }
-
-    pub fn set_monochrome(&mut self, monochrome: bool) {
-        self.monochrome = monochrome;
-        if let Some(ref mut picker) = self.picker {
-            picker.set_monochrome(monochrome);
-        }
-    }
-
-    pub fn set_prompt_names(&mut self, names: Vec<String>) {
-        self.prompt_names = names;
-    }
-
-    pub fn set_theme_names(&mut self, names: Vec<String>) {
-        self.theme_names = names;
-    }
-
-    pub fn load_global_history(&mut self) {
-        if let Ok(entries) = crate::session::chat_history::load_history() {
-            self.history = entries
-                .into_iter()
-                .map(|e| CompactString::new(e.content))
-                .collect();
-            self.history_pos = None;
-        }
-    }
-
-    pub fn start_file_picker(&mut self) {
-        let mut picker = FilePicker::new();
-        picker.set_monochrome(self.monochrome);
-        picker.activate();
-        self.picker = Some(Picker::File(picker));
-    }
-
-    pub fn start_command_picker(&mut self) {
-        let mut picker = CommandPicker::new();
-        picker.set_monochrome(self.monochrome);
-        picker.activate();
-        self.picker = Some(Picker::Command(picker));
-    }
-
-    pub fn start_models_picker(&mut self) {
-        let mut picker = ModelsPicker::new();
-        picker.set_monochrome(self.monochrome);
-        if !self.quick_model_names.is_empty() {
-            picker.set_items(self.quick_model_names.clone());
-        }
-        picker.activate();
-        self.picker = Some(Picker::Models(picker));
-    }
-
-    pub fn start_prompt_picker(&mut self) {
-        let mut picker = PromptPicker::new();
-        picker.set_monochrome(self.monochrome);
-        if !self.prompt_names.is_empty() {
-            picker.set_items(self.prompt_names.clone());
-        }
-        picker.activate();
-        self.picker = Some(Picker::Prompt(picker));
-    }
-
-    pub fn start_theme_picker(&mut self) {
-        let mut picker = ThemePicker::new();
-        picker.set_monochrome(self.monochrome);
-        if !self.theme_names.is_empty() {
-            picker.set_items(self.theme_names.clone());
-        }
-        picker.activate();
-        self.picker = Some(Picker::Theme(picker));
-    }
-
-    pub fn handle_picker_key(&mut self, key: KeyEvent) -> bool {
-        match self.picker.as_mut() {
-            Some(Picker::File(p)) => {
-                handle_file_picker_key(&mut self.buffer, &mut self.cursor, p, key)
-            }
-            Some(Picker::Command(p)) => {
-                let (handled, replacement) = handle_command_picker_key(
-                    &mut self.buffer,
-                    &mut self.cursor,
-                    &self.prompt_names,
-                    &self.theme_names,
-                    &self.quick_model_names,
-                    p,
-                    key,
-                );
-                if let Some(new_picker) = replacement {
-                    self.picker = Some(new_picker);
-                }
-                handled
-            }
-            Some(Picker::Prompt(p)) => {
-                handle_prompt_picker_key(&mut self.buffer, &mut self.cursor, p, key)
-            }
-            Some(Picker::Models(p)) => {
-                handle_models_picker_key(&mut self.buffer, &mut self.cursor, p, key)
-            }
-            Some(Picker::Theme(p)) => {
-                handle_theme_picker_key(&mut self.buffer, &mut self.cursor, p, key)
-            }
-            _ => false,
-        }
-    }
-
-    pub fn open_in_editor(&mut self) {
-        let editor = self
-            .editor
-            .clone()
-            .or_else(|| std::env::var("EDITOR").ok())
-            .unwrap_or_else(|| "editor".to_string());
-
-        let tmp = std::env::temp_dir().join(format!("zerostack-{}.md", std::process::id()));
-
-        let _ = std::fs::write(&tmp, self.buffer.as_bytes());
-
-        let _ = crossterm::terminal::disable_raw_mode();
-        let mut stdout = std::io::stdout();
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::event::DisableMouseCapture,
-        );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::terminal::LeaveAlternateScreen,
-        );
-        let _ = stdout.flush();
-
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("{} \"$1\"", editor))
-            .arg("sh")
-            .arg(&tmp)
-            .status();
-
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::terminal::EnterAlternateScreen,
-        );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::event::EnableMouseCapture,
-        );
-        let _ = crossterm::terminal::enable_raw_mode();
-
-        if let Ok(content) = std::fs::read_to_string(&tmp) {
-            self.buffer = CompactString::new(content.trim_end().to_string());
-            self.cursor = self.buffer.len();
-        }
-
-        let _ = std::fs::remove_file(&tmp);
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
-        match key.code {
-            KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    || key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                if self.picker.as_ref().is_some_and(|p| p.active()) {
-                    return None;
-                }
-                self.buffer.insert(self.cursor, '\n');
-                self.cursor += 1;
-                None
-            }
-            KeyCode::Enter => {
-                if self.picker.as_ref().is_some_and(|p| p.active()) {
-                    return None;
-                }
-                let text = self.buffer.clone();
-                let is_blank = text.trim().is_empty();
-                if !is_blank {
-                    self.history.push(text.clone());
-                }
-                self.history_pos = None;
-                self.buffer.clear();
-                self.cursor = 0;
-                if is_blank { None } else { Some(text) }
-            }
-            KeyCode::Char(c)
-                if c == '\x08' || (c == 'h' && key.modifiers.contains(KeyModifiers::CONTROL)) =>
-            {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                    self.buffer.remove(self.cursor);
-                }
-                None
-            }
-            KeyCode::Char(c) => {
-                if c == '@' {
-                    let at_word_start = self.cursor == 0
-                        || self.buffer.as_bytes().get(self.cursor - 1) == Some(&b' ');
-                    if at_word_start {
-                        self.start_file_picker();
-                    }
-                }
-                if c == '/' && self.cursor == 0 {
-                    self.start_command_picker();
-                }
-                self.buffer.insert(self.cursor, c);
-                self.cursor += c.len_utf8();
-                self.history_pos = None;
-
-                // Check if we should activate pickers after typing certain prefixes
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/prompt ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/prompt ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_prompt_picker();
-                            if let Some(Picker::Prompt(ref mut pp)) = self.picker {
-                                pp.char_input(c);
-                            }
-                        }
-                    }
-                }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/models ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/models ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_models_picker();
-                            if let Some(Picker::Models(ref mut mp)) = self.picker {
-                                mp.char_input(c);
-                            }
-                        }
-                    }
-                }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/theme ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/theme ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_theme_picker();
-                            if let Some(Picker::Theme(ref mut tp)) = self.picker {
-                                tp.char_input(c);
-                            }
-                        }
-                    }
-                }
-
-                None
-            }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                    self.buffer.remove(self.cursor);
-                }
-                None
-            }
-            KeyCode::Delete => {
-                if self.cursor < self.buffer.len() {
-                    self.buffer.remove(self.cursor);
-                }
-                None
-            }
-            KeyCode::Left => {
-                if self.cursor > 0 {
-                    self.cursor = prev_char_boundary(&self.buffer, self.cursor);
-                }
-                None
-            }
-            KeyCode::Right => {
-                if self.cursor < self.buffer.len() {
-                    self.cursor = next_char_boundary(&self.buffer, self.cursor);
-                }
-                None
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                None
-            }
-            KeyCode::End => {
-                self.cursor = self.buffer.len();
-                None
-            }
-            KeyCode::Up => {
-                let hist_len = self.history.len();
-                if hist_len == 0 {
-                    return None;
-                }
-                let pos = match self.history_pos {
-                    Some(p) if p > 0 => p - 1,
-                    Some(_) => 0,
-                    None => hist_len - 1,
-                };
-                self.history_pos = Some(pos);
-                self.buffer = self.history[pos].clone();
-                self.cursor = self.buffer.len();
-                None
-            }
-            KeyCode::Down => {
-                match self.history_pos {
-                    Some(pos) if pos + 1 < self.history.len() => {
-                        let new_pos = pos + 1;
-                        self.history_pos = Some(new_pos);
-                        self.buffer = self.history[new_pos].clone();
-                        self.cursor = self.buffer.len();
-                    }
-                    Some(_) => {
-                        self.history_pos = None;
-                        self.buffer.clear();
-                        self.cursor = 0;
-                    }
-                    None => {}
-                }
-                None
-            }
-            KeyCode::Tab => {
-                self.buffer.insert_str(self.cursor, "  ");
-                self.cursor += 2;
-                None
-            }
-            _ => None,
-        }
-    }
-}
-
-fn handle_file_picker_key(
+pub fn handle_file_picker_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
     picker: &mut FilePicker,
@@ -543,7 +145,7 @@ fn handle_file_picker_key(
     }
 }
 
-fn handle_command_picker_key(
+pub fn handle_command_picker_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
     prompt_names: &[String],
@@ -671,7 +273,7 @@ fn handle_command_picker_key(
     }
 }
 
-fn handle_models_picker_key(
+pub fn handle_models_picker_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
     picker: &mut ModelsPicker,
@@ -780,7 +382,7 @@ fn handle_models_picker_key(
     }
 }
 
-fn handle_theme_picker_key(
+pub fn handle_theme_picker_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
     picker: &mut ThemePicker,
@@ -889,7 +491,7 @@ fn handle_theme_picker_key(
     }
 }
 
-fn handle_prompt_picker_key(
+pub fn handle_prompt_picker_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
     picker: &mut PromptPicker,

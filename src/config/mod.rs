@@ -1,50 +1,21 @@
+pub mod load;
+pub mod types;
+
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use compact_str::CompactString;
 use serde::{Deserialize, Serialize};
 
-use crate::permission::PermissionConfig;
-use crate::session::storage;
+pub use load::*;
+pub use types::*;
+
+use crate::permission::{PermissionConfig, PermissionConfigs};
 
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::config::McpServerConfig;
 
 #[cfg(feature = "acp")]
 use crate::extras::acp::config::AcpServerConfig;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QuickModelConfig {
-    pub provider: CompactString,
-    pub model: CompactString,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CustomProviderConfig {
-    pub provider_type: CompactString,
-    pub base_url: String,
-    pub api_key_env: Option<CompactString>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub danger_accept_invalid_certs: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ColorsConfig {
-    pub chat_background: Option<CompactString>,
-    pub input_background: Option<CompactString>,
-    pub status_background: Option<CompactString>,
-}
-
-impl Default for ColorsConfig {
-    fn default() -> Self {
-        ColorsConfig {
-            chat_background: None,
-            input_background: None,
-            status_background: None,
-        }
-    }
-}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -74,9 +45,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub custom_providers: Option<HashMap<String, CustomProviderConfig>>,
+    pub custom_providers: Option<HashMap<String, types::CustomProviderConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-regex")]
+    pub permission_regex: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "permission-allow")]
     pub permission_allow: Option<HashMap<String, Vec<String>>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "permission-ask")]
@@ -99,18 +72,20 @@ pub struct Config {
     pub show_tool_details: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
+    #[cfg(feature = "git-worktree")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "wt-auto-merge")]
+    pub wt_auto_merge: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub editor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_keys: Option<std::collections::HashMap<String, String>>,
+    pub api_keys: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub quick_models: Option<std::collections::HashMap<String, QuickModelConfig>>,
+    pub quick_models: Option<HashMap<String, types::QuickModelConfig>>,
     #[cfg(feature = "mcp")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<HashMap<String, McpServerConfig>>,
-
     #[cfg(feature = "acp")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_servers: Option<HashMap<String, AcpServerConfig>>,
@@ -121,11 +96,11 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub colors: Option<ColorsConfig>,
+    pub colors: Option<types::ColorsConfig>,
 }
 
 impl Config {
-    pub fn custom_providers_map(&self) -> HashMap<String, CustomProviderConfig> {
+    pub fn custom_providers_map(&self) -> HashMap<String, types::CustomProviderConfig> {
         self.custom_providers.clone().unwrap_or_default()
     }
 
@@ -145,146 +120,31 @@ impl Config {
         self.compact_enabled.unwrap_or(true)
     }
 
-    pub fn build_permission_config(&self) -> PermissionConfig {
-        let mut perm_config: PermissionConfig = self
+    pub fn build_permission_config(&self) -> PermissionConfigs {
+        let glob: PermissionConfig = self
             .permission
             .as_ref()
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
+        let regex: PermissionConfig = self
+            .permission_regex
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let mut perm_configs = PermissionConfigs { glob, regex };
+
         if let Some(allow) = &self.permission_allow {
-            perm_config.allow_entries = Some(allow.clone());
+            perm_configs.glob.allow_entries = Some(allow.clone());
         }
         if let Some(ask) = &self.permission_ask {
-            perm_config.ask_entries = Some(ask.clone());
+            perm_configs.glob.ask_entries = Some(ask.clone());
         }
         if let Some(deny) = &self.permission_deny {
-            perm_config.deny_entries = Some(deny.clone());
+            perm_configs.glob.deny_entries = Some(deny.clone());
         }
 
-        perm_config
+        perm_configs
     }
-}
-
-fn resolve_config_path() -> PathBuf {
-    let dir = storage::config_path();
-    let toml = dir.join("config.toml");
-    let json = dir.join("config.json");
-    if toml.exists() {
-        toml
-    } else if json.exists() {
-        json
-    } else {
-        toml
-    }
-}
-
-pub fn config_file_path() -> PathBuf {
-    resolve_config_path()
-}
-
-pub fn quick_models_map(cfg: &Config) -> HashMap<String, QuickModelConfig> {
-    cfg.quick_models.clone().unwrap_or_default()
-}
-
-pub fn save_quick_model(name: &str, provider: &str, model: &str) -> std::io::Result<()> {
-    let path = resolve_config_path();
-    let mut cfg: Config = if path.exists() {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("toml") => toml::from_str(&content).unwrap_or_default(),
-            _ => serde_json::from_str(&content).unwrap_or_default(),
-        }
-    } else {
-        Config::default()
-    };
-
-    let quick_models = cfg.quick_models.get_or_insert_with(HashMap::new);
-    quick_models.insert(
-        name.to_string(),
-        QuickModelConfig {
-            provider: CompactString::new(provider),
-            model: CompactString::new(model),
-        },
-    );
-
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid config path")
-    })?;
-    std::fs::create_dir_all(parent)?;
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("toml") => {
-            let content =
-                toml::to_string(&cfg).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-            std::fs::write(&path, content)?;
-        }
-        _ => std::fs::write(&path, serde_json::to_string_pretty(&cfg)?)?,
-    }
-    Ok(())
-}
-
-pub fn load() -> Config {
-    let path = resolve_config_path();
-    #[allow(unused_mut)]
-    let mut cfg: Config = if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let default = Config::default();
-        if path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            if let Ok(content) = toml::to_string(&default) {
-                std::fs::write(&path, content).ok();
-            }
-        }
-        default
-    } else {
-        let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!(
-                "error: failed to read config file ({}): {}\n\
-                 Fix the file or remove it to use defaults.",
-                path.display(),
-                e,
-            );
-            std::process::exit(1);
-        });
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("toml") => toml::from_str(&content).unwrap_or_else(|e| {
-                eprintln!(
-                    "error: {} is not a valid config: {}\n\
-                     Fix the file or remove it to use defaults.",
-                    path.display(),
-                    e,
-                );
-                std::process::exit(1);
-            }),
-            _ => serde_json::from_str(&content).unwrap_or_else(|e| {
-                eprintln!(
-                    "error: {} is not a valid config: {}\n\
-                     Fix the file or remove it to use defaults.",
-                    path.display(),
-                    e,
-                );
-                std::process::exit(1);
-            }),
-        }
-    };
-
-    #[cfg(feature = "mcp")]
-    if cfg.mcp_servers.is_none() {
-        let mut headers = HashMap::new();
-        if let Ok(key) = std::env::var("EXA_API_KEY") {
-            headers.insert("x-api-key".to_string(), key);
-        }
-        let mut defaults = HashMap::new();
-        defaults.insert(
-            "Exa Web Search".to_string(),
-            McpServerConfig::Url {
-                url: "https://mcp.exa.ai/mcp".to_string(),
-                headers,
-            },
-        );
-        cfg.mcp_servers = Some(defaults);
-    }
-
-    cfg
 }

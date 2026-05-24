@@ -111,3 +111,27 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
 pub fn agents_path() -> PathBuf {
     config_path().join("agent").join("AGENTS.md")
 }
+
+fn theme_file_path() -> PathBuf {
+    data_dir().join("theme.json")
+}
+
+pub fn save_theme_name(name: Option<&str>) -> anyhow::Result<()> {
+    let path = theme_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let value = match name {
+        Some(n) => serde_json::json!({ "theme": n }),
+        None => serde_json::json!({ "theme": null }),
+    };
+    std::fs::write(&path, serde_json::to_string_pretty(&value)?)?;
+    Ok(())
+}
+
+pub fn load_theme_name() -> Option<String> {
+    let path = theme_file_path();
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value.get("theme")?.as_str().map(|s| s.to_string())
+}
