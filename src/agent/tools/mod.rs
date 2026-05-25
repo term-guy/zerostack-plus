@@ -3,9 +3,12 @@ pub(crate) mod edit;
 mod find_files;
 mod grep;
 mod list_dir;
+mod normalize;
 mod read;
 mod todo;
 mod write;
+
+pub(crate) use normalize::{levenshtein_similarity, normalize_whitespace};
 
 pub use bash::BashTool;
 pub use edit::EditTool;
@@ -65,9 +68,13 @@ pub struct WriteArgs {
 #[derive(Deserialize)]
 pub struct EditArgs {
     pub path: String,
-    pub old_text: String,
-    pub new_text: String,
-    pub replace_all: Option<bool>,
+    pub block: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EditBlock {
+    pub search: String,
+    pub replace: String,
 }
 
 #[derive(Deserialize)]

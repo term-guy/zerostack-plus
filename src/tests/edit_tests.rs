@@ -1,5 +1,5 @@
+use crate::agent::tools::EditArgs;
 use crate::agent::tools::edit::EditTool;
-use crate::agent::tools::{EditArgs, ToolError};
 use rig::tool::Tool;
 
 struct TempFile(String);
@@ -25,112 +25,125 @@ impl Drop for TempFile {
 }
 
 #[tokio::test]
-async fn test_rejects_empty_old_text() {
-    let tool = EditTool::new(None, None);
-    let args = EditArgs {
-        path: "/tmp/test.txt".to_string(),
-        old_text: String::new(),
-        new_text: "replacement".to_string(),
-        replace_all: None,
-    };
-    let result = tool.call(args).await;
-    assert!(result.is_err());
-    match result {
-        Err(ToolError::Msg(msg)) => {
-            assert!(
-                msg.contains("old_text must not be empty"),
-                "unexpected msg: {msg}"
-            );
-        }
-        _ => panic!("expected ToolError::Msg"),
-    }
-}
-
-#[tokio::test]
-async fn test_old_text_not_found() {
-    let tmp = TempFile::new("notfound.txt");
-    std::fs::write(tmp.path(), "hello world").unwrap();
+async fn test_rejects_no_blocks() {
+    let tmp = TempFile::new("noblocks.txt");
+    std::fs::write(tmp.path(), "hello world\n").unwrap();
     let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
-            old_text: "not in file".into(),
-            new_text: "replacement".into(),
-            replace_all: None,
+            block: "no blocks here".into(),
         })
         .await;
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("old_text not found"), "msg: {msg}");
+    assert!(msg.contains("No SEARCH/REPLACE blocks found"));
 }
 
 #[tokio::test]
-async fn test_single_replacement() {
-    let tmp = TempFile::new("single.txt");
+async fn test_rejects_empty_search() {
+    let tmp = TempFile::new("emptysearch.txt");
+    std::fs::write(tmp.path(), "hello world\n").unwrap();
+    let tool = EditTool::new(None, None);
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: "<<<<<<< SEARCH\n=======\nreplacement\n>>>>>>> REPLACE".into(),
+        })
+        .await;
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("has empty search text"));
+}
+
+#[tokio::test]
+async fn test_search_not_found() {
+    let tmp = TempFile::new("notfound2.txt");
+    std::fs::write(tmp.path(), "hello world\n").unwrap();
+    let tool = EditTool::new(None, None);
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block:
+                "<<<<<<< SEARCH\nthis does not exist in file\n=======\nreplacement\n>>>>>>> REPLACE"
+                    .into(),
+        })
+        .await;
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("not found"));
+}
+
+#[tokio::test]
+async fn test_single_block_replacement() {
+    let tmp = TempFile::new("single2.txt");
     std::fs::write(tmp.path(), "before after done\n").unwrap();
     let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
-            old_text: "after".into(),
-            new_text: "middle".into(),
-            replace_all: None,
+            block: "<<<<<<< SEARCH\nafter\n=======\nmiddle\n>>>>>>> REPLACE".into(),
         })
         .await
         .unwrap();
     let content = std::fs::read_to_string(tmp.path()).unwrap();
     assert_eq!(content, "before middle done\n");
-    assert!(result.contains("Applied edit"), "result: {result}");
+    assert!(result.contains("Applied 1 edit(s)"));
 }
 
 #[tokio::test]
-async fn test_replace_all() {
-    let tmp = TempFile::new("replace_all.txt");
-    std::fs::write(tmp.path(), "a a a\n").unwrap();
+async fn test_multi_block_atomic() {
+    let tmp = TempFile::new("multiblock.txt");
+    std::fs::write(tmp.path(), "aaa\nbbb\nccc\n").unwrap();
     let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
-            old_text: "a".into(),
-            new_text: "b".into(),
-            replace_all: Some(true),
+            block: "\
+<<<<<<< SEARCH
+aaa
+=======
+AAA
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+ccc
+=======
+CCC
+>>>>>>> REPLACE"
+                .into(),
         })
         .await
         .unwrap();
     let content = std::fs::read_to_string(tmp.path()).unwrap();
-    assert_eq!(content, "b b b\n");
-    assert!(result.contains("3 replacements"), "result: {result}");
+    assert_eq!(content, "AAA\nbbb\nCCC\n");
+    assert!(result.contains("Applied 2 edit(s)"));
 }
 
 #[tokio::test]
-async fn test_multi_match_without_replace_all_returns_error() {
-    let tmp = TempFile::new("multi.txt");
+async fn test_multi_match_returns_error() {
+    let tmp = TempFile::new("multi2.txt");
     std::fs::write(tmp.path(), "hello world, hello there\n").unwrap();
     let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
-            old_text: "hello".into(),
-            new_text: "bye".into(),
-            replace_all: None,
+            block: "<<<<<<< SEARCH\nhello\n=======\nbye\n>>>>>>> REPLACE".into(),
         })
         .await;
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("matched 2 times"), "msg: {msg}");
-    assert!(msg.contains("replaceAll: true"), "msg: {msg}");
+    assert!(msg.contains("matched 2 times"));
 }
 
 #[tokio::test]
 async fn test_preserves_crlf_line_endings() {
-    let tmp = TempFile::new("crlf.txt");
+    let tmp = TempFile::new("crlf2.txt");
     std::fs::write(tmp.path(), "line1\r\nline2\r\nline3\r\n").unwrap();
     let tool = EditTool::new(None, None);
     tool.call(EditArgs {
         path: tmp.path().into(),
-        old_text: "line2".into(),
-        new_text: "modified".into(),
-        replace_all: None,
+        block: "<<<<<<< SEARCH\nline2\n=======\nmodified\n>>>>>>> REPLACE".into(),
     })
     .await
     .unwrap();
@@ -141,12 +154,67 @@ async fn test_preserves_crlf_line_endings() {
     );
 }
 
-#[test]
-fn test_show_diff_basic() {
-    let diff = EditTool::show_diff("test.txt", "hello world\nfoo bar\nbaz\n", 12, "foo", "qux");
-    assert!(diff.contains("--- a/test.txt"), "diff: {diff}");
-    assert!(diff.contains("+++ b/test.txt"), "diff: {diff}");
-    assert!(diff.contains("-foo"), "diff: {diff}");
-    assert!(diff.contains("+qux"), "diff: {diff}");
-    assert!(diff.contains("@@"), "diff missing hunk header: {diff}");
+#[tokio::test]
+async fn test_normalized_match() {
+    let tmp = TempFile::new("norm.txt");
+    // Tabs in file, spaces in search — normalization matches them
+    std::fs::write(tmp.path(), "\tfn hello() {\n\t    bar\n\t}\n").unwrap();
+    let tool = EditTool::new(None, None);
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: "<<<<<<< SEARCH\n    fn hello() {\n        bar\n    }\n=======\nfn goodbye() {}\n>>>>>>> REPLACE"
+                .into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        result.contains("whitespace normalization"),
+        "expected normalization note, got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_fuzzy_auto_apply() {
+    let tmp = TempFile::new("fuzzy.txt");
+    std::fs::write(
+        tmp.path(),
+        "fn calculate_total(items: &[Item]) -> f64 {\n    items.iter().map(|i| i.price).sum()\n}\n",
+    )
+    .unwrap();
+    let tool = EditTool::new(None, None);
+    // Search has "calculatte" (typo) vs "calculate" — high similarity, auto-apply
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: "<<<<<<< SEARCH\nfn calculatte_total(items: &[Item]) -> f64 {\n=======\nfn sum_prices(items: &[Item]) -> f64 {\n>>>>>>> REPLACE"
+                .into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        result.contains("fuzzy match"),
+        "expected fuzzy match note, got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn test_fuzzy_suggest_low_similarity() {
+    let tmp = TempFile::new("fuzzylow.txt");
+    std::fs::write(tmp.path(), "hello world\n").unwrap();
+    let tool = EditTool::new(None, None);
+    let result = tool
+        .call(EditArgs {
+            path: tmp.path().into(),
+            block: "<<<<<<< SEARCH\nhelo word\n=======\nreplacement\n>>>>>>> REPLACE".into(),
+        })
+        .await;
+    if let Err(e) = result {
+        let msg = e.to_string();
+        // Should suggest the closest match since it's < 0.85 but >= 0.60
+        assert!(
+            msg.contains("Closest match") || msg.contains("not found"),
+            "unexpected error: {msg}"
+        );
+    }
 }

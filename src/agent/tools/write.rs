@@ -37,7 +37,7 @@ impl Tool for WriteTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "write".to_string(),
-            description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".to_string(),
+            description: "Create a new file with the given content. Fails if the file already exists — use edit for existing files. Automatically creates parent directories.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -50,9 +50,16 @@ impl Tool for WriteTool {
     }
 
     async fn call(&self, args: WriteArgs) -> Result<String, ToolError> {
-        check_perm_path(&self.permission, &self.ask_tx, "write", &args.path).await?;
+        let expanded = crate::fs::expand_tilde(&args.path);
+        check_perm_path(&self.permission, &self.ask_tx, "write", &expanded).await?;
 
-        let path = Path::new(&args.path);
+        let path = Path::new(&expanded);
+        if path.exists() {
+            return Err(ToolError::Msg(format!(
+                "File '{}' already exists. Use edit for targeted changes, or delete and recreate if a full rewrite is needed.",
+                expanded
+            )));
+        }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -64,6 +71,6 @@ impl Tool for WriteTool {
             )));
         }
         tokio::fs::write(path, &args.content).await?;
-        Ok(format!("Written {} bytes to {}", bytes, args.path))
+        Ok(format!("Written {} bytes to {}", bytes, expanded))
     }
 }

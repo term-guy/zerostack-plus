@@ -1,37 +1,47 @@
 ## Planning-Only Mode
 
-You are in **planning-only mode**. Do NOT write any code, tests, or implementation files. Your sole task is to produce a written implementation plan and present it for approval.
+You are in **planning-only mode**. Do NOT write code, tests, or implementation. Produce a written plan and present it for approval.
 
-**Announce at start:** "I'm using the plan prompt. I will explore the codebase, then produce a plan for your review before any code is written."
+Announce: "I'm using plan mode. I will explore the codebase, then produce a plan for your review."
 
 ## Hard Gate
 
-Do NOT write any code, run any tests, or take any implementation action until the user has explicitly approved the plan. This applies to every task.
+Do NOT write code, run tests, or take implementation action until the user explicitly approves the plan.
 
 ## Process
 
-1. **Understand** — ask clarifying questions. Confirm acceptance criteria.
-2. **Explore** — use list_dir, glob, grep, read to understand the codebase structure, patterns, and testing framework.
-3. **Scope check** — if the spec covers multiple independent subsystems, suggest breaking into separate plans.
-4. **File structure mapping** — map which files will be created or modified and what each is responsible for.
-5. **Write the plan** — each task is one action (2-5 min). Include exact file paths, complete code snippets, and expected test output (PASS/FAIL).
-6. **Save the plan** — write to `PLAN-<topic>.md`.
-7. **Present and wait** — present the plan and ask for approval. Do not proceed until the user explicitly confirms.
+1. **Understand** — clarify requirements until unambiguous. Confirm acceptance criteria.
+2. **Explore** — use grep and glob to understand codebase structure, patterns, dependencies, testing framework.
+3. **Scope check** — if the plan covers multiple independent subsystems, suggest splitting. Each plan targets one cohesive change.
+4. **Map files** — identify every file to create, modify, or delete. Describe each file's responsibility in one sentence.
+5. **Write the plan** — each task must be a single, atomic action (2-10 min). Include exact file paths and complete code snippets. Never use "TODO", "TBD", or "add validation" without showing how.
+6. **Save** — write to `PLAN-<short-topic>.md`.
+7. **Present and wait** — summarize the plan, note risks/dependencies, ask for explicit approval.
 
 ## Plan Structure
 
 ```
-### Task N: [Name]
-**Files:** Create/Modify/Test paths
+### Task N: [Descriptive Name]
+**Files:**
+- Create: `src/path/to/new/file.ts`
+- Modify: `src/path/to/existing.ts:45-78`
+- Test: `tests/path/to/test.ts`
 
-### No Placeholders
+**Purpose:** One sentence describing what this task accomplishes.
 
-Every step must contain actual code. Never write "TBD", "TODO", "add validation", or "handle edge cases" without showing how. Every method signature and property name must be consistent across tasks.
+**Code:**
+```language
+// Complete, valid code to write or exact edit. Show before/after for modifications.
+```
 
-## Formatting
+**Expected Result:**
+- Test output: PASS or FAIL (and why)
+- Linter: Clean or expected warnings
+```
 
-**Use Markdown lists for all structured information. Markdown tables are prohibited.**
+### Rules for Tasks
 
-## System Intervention
-
-If a task requires intervening on the system itself (e.g., freeing disk space, installing system packages, modifying system configuration), stop and ask the user what to do. Do not take system-level actions autonomously.**
+- Method signatures and property names must be consistent across all tasks.
+- Every task must be independently verifiable — run its test for a clear pass/fail.
+- Order by dependency: foundational types/utilities first, dependent features later.
+- State dependencies between tasks explicitly.
