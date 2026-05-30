@@ -1,11 +1,11 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
-use crate::agent::tools::{
-    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_path,
-    edit_system, levenshtein_similarity, normalize_whitespace,
-};
 use crate::agent::tools::crc::crc32_hex;
+use crate::agent::tools::{
+    AskSender, EditArgs, EditBlock, EditOp, PermCheck, ToolError, check_perm_path, edit_system,
+    levenshtein_similarity, normalize_whitespace,
+};
 use crate::config::types::EditSystem;
 
 pub struct EditTool {
@@ -97,26 +97,31 @@ fn compute_byte_range(content: &str, norm_pos: usize, norm_len: usize) -> (usize
     let content_norm = normalize_whitespace(content);
     let norm_end = (norm_pos + norm_len).min(content_norm.len());
 
-    // Walk original content byte-by-byte in sync with normalized content
     let mut orig_pos = 0usize;
-    let mut norm_rem = 0usize; // remaining normalized chars consumed
-    let mut start_set = false;
-    let mut byte_start = 0usize;
+    let mut norm_rem = 0usize;
+    let mut byte_start = None;
 
-    for b in content.bytes() {
+    while orig_pos < content.len() && norm_rem < norm_end {
         if norm_rem >= content_norm.len() {
             break;
         }
 
-        let norm_ch = content_norm.as_bytes()[norm_rem];
+        let b = content.as_bytes()[orig_pos];
 
-        // Skip spaces in normalized that were inserted (tab->space expansion)
-        if b == b'\t' && norm_ch == b' ' {
+        // Tab -> space expansion: 1 tab byte maps to 4 spaces in normalized
+        if b == b'\t' {
+            let tab_spaces = 4usize;
             if norm_rem < norm_pos {
                 orig_pos += 1;
-                norm_rem += 1;
+                norm_rem = (norm_rem + tab_spaces).min(content_norm.len());
                 continue;
             }
+            if byte_start.is_none() {
+                byte_start = Some(orig_pos);
+            }
+            orig_pos += 1;
+            norm_rem = (norm_rem + tab_spaces).min(content_norm.len());
+            continue;
         }
 
         if norm_rem < norm_pos {
@@ -125,17 +130,13 @@ fn compute_byte_range(content: &str, norm_pos: usize, norm_len: usize) -> (usize
             continue;
         }
 
-        if !start_set {
-            byte_start = orig_pos;
-            start_set = true;
+        if byte_start.is_none() {
+            byte_start = Some(orig_pos);
         }
 
-        if norm_rem >= norm_end {
-            break;
-        }
-
-        // CRLF edge case: original has \r\n, normalized just has \n
-        if b == b'\r' && norm_rem < content_norm.len() && content_norm.as_bytes()[norm_rem] == b'\n' {
+        // CRLF edge case: original \r\n maps to a single \n in normalized
+        if b == b'\r' && norm_rem < content_norm.len() && content_norm.as_bytes()[norm_rem] == b'\n'
+        {
             orig_pos += 1;
             continue;
         }
@@ -144,11 +145,9 @@ fn compute_byte_range(content: &str, norm_pos: usize, norm_len: usize) -> (usize
         norm_rem += 1;
     }
 
-    if !start_set {
-        (0, content.len())
-    } else {
-        (byte_start, orig_pos)
-    }
+    // Fallback: no match region found — return zero-length range at end of file
+    let start = byte_start.unwrap_or(content.len());
+    (start, orig_pos)
 }
 
 fn find_best_match(content: &str, search: &str) -> MatchResult {
@@ -227,7 +226,11 @@ fn count_exact_matches(content: &str, search: &str) -> usize {
     content.match_indices(search).count()
 }
 
-async fn handle_similarity(path: &str, block: &str, content: &str) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
+async fn handle_similarity(
+    path: &str,
+    block: &str,
+    content: &str,
+) -> Result<(Vec<String>, Vec<(usize, usize, String)>), ToolError> {
     let blocks = parse_blocks(block)?;
 
     struct ResolvedSim {
@@ -333,7 +336,7 @@ async fn handle_similarity(path: &str, block: &str, content: &str) -> Result<(Ve
 // ── V2: Hashedit (tag-based) ────────────────────────────────────────────
 
 fn parse_tagged_line(raw: &str) -> Option<(usize, String)> {
-    let stripped = raw.trim_start_matches(|c: char| c == ' ' || c == '\t');
+    let stripped = raw.trim_start_matches([' ', '\t']);
     let (num_tag, _content) = stripped.split_once(' ')?;
     let (num_str, tag) = num_tag.split_once('|')?;
     let line_num: usize = num_str.parse().ok()?;
@@ -369,7 +372,11 @@ fn extract_line_info(lines_raw: &str) -> Result<Vec<(usize, String)>, ToolError>
 fn validate_tag(content_lines: &[&str], line_num: usize, tag: &str) -> Result<(), ToolError> {
     let idx = line_num.saturating_sub(1);
     let actual = content_lines.get(idx).ok_or_else(|| {
-        ToolError::Msg(format!("Line {} is out of range (file has {} lines)", line_num, content_lines.len()))
+        ToolError::Msg(format!(
+            "Line {} is out of range (file has {} lines)",
+            line_num,
+            content_lines.len()
+        ))
     })?;
     let expected = crc32_hex(actual.as_bytes());
     if expected != tag {
@@ -381,14 +388,24 @@ fn validate_tag(content_lines: &[&str], line_num: usize, tag: &str) -> Result<()
     Ok(())
 }
 
-fn line_range_to_byte_range(content_lines: &[&str], start_line: usize, end_line: usize) -> (usize, usize) {
+fn line_range_to_byte_range(
+    content_lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+) -> (usize, usize) {
+    if content_lines.is_empty() || start_line == 0 || start_line > content_lines.len() {
+        return (0, 0);
+    }
+    let end_line = end_line.min(content_lines.len());
+
     // Byte position before start_line
     let byte_start: usize = content_lines[..start_line.saturating_sub(1)]
         .iter()
         .map(|l| l.len() + 1)
         .sum();
 
-    // Include lines up to end_line
+    // The +1 per line accounts for newline separators; saturating_sub(1)
+    // removes the phantom newline from the last line in the range.
     let byte_end = byte_start
         + content_lines[start_line.saturating_sub(1)..end_line]
             .iter()
@@ -433,9 +450,8 @@ async fn handle_hashedit(
                         label, single_line
                     ))
                 })?;
-                validate_tag(&content_lines, line_num, &tag).map_err(|e| {
-                    ToolError::Msg(format!("{}{}", label, e))
-                })?;
+                validate_tag(&content_lines, line_num, &tag)
+                    .map_err(|e| ToolError::Msg(format!("{}{}", label, e)))?;
 
                 let (byte_start, byte_end) =
                     line_range_to_byte_range(&content_lines, line_num, line_num);
@@ -444,9 +460,8 @@ async fn handle_hashedit(
             (None, Some(multi_lines)) => {
                 let entries = extract_line_info(multi_lines)?;
                 for &(line_num, ref tag) in &entries {
-                    validate_tag(&content_lines, line_num, tag).map_err(|e| {
-                        ToolError::Msg(format!("{}{}", label, e))
-                    })?;
+                    validate_tag(&content_lines, line_num, tag)
+                        .map_err(|e| ToolError::Msg(format!("{}{}", label, e)))?;
                 }
                 let start_line = entries[0].0;
                 let end_line = entries[entries.len() - 1].0;
