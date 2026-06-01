@@ -37,9 +37,12 @@ Example (JSON):
   "reserve_tokens": 16384,
   "keep_recent_tokens": 20000,
   "compact_enabled": true,
+  "deny_repeated_reads": false,
   "default_prompt": "code",
   "default_permission_mode": "standard",
+  "permission-modes": ["guarded", "standard", "yolo"],
   "show_tool_details": false,
+  "sandbox": false,
   "quick_models": {
     "fast": {
       "provider": "openai",
@@ -100,6 +103,7 @@ compact_enabled = true
 edit_system = "similarity"
 default_prompt = "code"
 default_permission_mode = "standard"
+permission-modes = ["guarded", "standard", "yolo"]
 show_tool_details = false
 
 [quick_models.fast]
@@ -140,12 +144,14 @@ Accepted top-level keys:
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `100`.                                                                                                                           |
 | `temperature`             | number  | Model temperature value. Only configurable via the `--temperature` CLI flag (`0.0` to `2.0`). Config-file value is parsed but not currently applied.                        |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
-| `no_context_files`        | boolean | Disable loading global/project `AGENTS.md` and `CLAUDE.md` context files. Default: `false`.                                                                                 |
+| `no_context_files`        | boolean | Disable loading global/project `AGENTS.md`, `CLAUDE.md`, and `ARCHITECTURE.md` (if `archmd` feature enabled) context files. Default: `false`.                               |
 | `context_window`          | integer | Session context-window size used for status and auto-compaction. Default: `128000`.                                                                                         |
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. Default: `16384`.                                                                                                         |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. Default: `20000`.                                                                                          |
 | `max_text_file_size`      | integer | Maximum allowed file size in bytes for read/write tool operations. Default: `1048576` (1 MB).                                                                               |
+| `deny_repeated_reads`     | boolean | Block repeated reads of the same file section within a session until the file is edited or written. Default: `true`. Set to `false` to allow re-reading.                     |
 | `compact_enabled`         | boolean | Enable automatic conversation compaction. Default: `true`.                                                                                                                  |
+| `always_show_welcome`     | boolean | Always show the welcome banner on startup, bypassing the one-shot marker file. Default: `false`.                                                                               |
 | `edit_system`             | string  | Edit system mode: `"similarity"` (SEARCH/REPLACE with fuzzy matching, default) or `"hashedit"` (CRC-32 tag-based CAS edits). See Edit System Modes below.                     |
 | `custom_providers`        | object  | Map of provider aliases to `{ "provider_type", "base_url", "api_key_env", "api_style", "headers", "danger_accept_invalid_certs", "timeout_secs" }`. `provider_type` must resolve to a built-in provider type; `api_key_env` is optional. For OpenAI providers, `api_style` selects `"responses"` or `"completions"`, `headers` sets custom HTTP headers (values support `${ENV_VAR}` expansion), and `timeout_secs` overrides the HTTP timeout. `danger_accept_invalid_certs` disables TLS verification. See the OpenAI API styles section below. |
 | `permission`              | object  | Permission rules using glob patterns; see the permission config notes below.                                |
@@ -153,13 +159,14 @@ Accepted top-level keys:
 | `permission-allow`        | object  | Map of tool names to lists of glob patterns to allow. Works alongside the `permission` field. See below.    |
 | `permission-ask`          | object  | Map of tool names to lists of glob patterns to prompt on. Works alongside the `permission` field. See below.|
 | `permission-deny`         | object  | Map of tool names to lists of glob patterns to deny. Works alongside the `permission` field. See below.     |
-| `restrictive`             | boolean | Select restrictive permission mode. Overridden by `accept_all`/`yolo` if those are also true.                                                                               |
-| `accept_all`              | boolean | Select accept mode, equivalent to `--accept-all`. Overridden by `yolo` if true.                                                                                             |
-| `yolo`                    | boolean | Select yolo mode, auto-approving all operations.                                                                                                                            |
+| `restrictive`             | boolean | Select restrictive permission mode (ask for every operation). Overridden by `accept_all`/`yolo` if those are also true.                                                     |
+| `accept_all`              | boolean | Select standard permission mode with auto-allow within CWD (equivalent to `default_permission_mode = "standard"`). Overridden by `yolo` if true.                            |
+| `yolo`                    | boolean | Select yolo mode (allow all, ask for destructive bash commands).                                                                                                            |
+| `permission-modes`        | array   | List of mode names that apply config-based rules. Default: `["guarded", "standard", "yolo"]`. Modes excluded from this list skip config rule matching entirely.             |
 | `sandbox`                 | boolean | Run bash commands in the bubblewrap sandbox. Default: `false`.                                                                                                              |
-| `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Use `standard`, `restrictive`, `accept`, or `yolo`.                                                                   |
+| `default_permission_mode` | string  | Permission mode when no mode boolean/CLI flag is set. Accepts: `standard` (default), `restrictive`, `readonly`, `guarded`, `yolo`.                                          |
 | `show_tool_details`       | boolean | Show tool-result previews in the TUI. Default: `false`.                                                                                                                     |
-| `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`.                                                                                                                        |
+| `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`. If the prompt file has a `%%mode=<mode>` first-line directive, the security mode is set automatically (see Prompt directives below). |
 | `editor`                  | string  | Editor command for `Ctrl+G` (default: `$EDITOR` env var, then `editor`, then `nano`).                                                                                        |
 | `api_keys`                | object  | Map of provider names to API keys (e.g. `"openai": "sk-..."`). Used as fallback when the corresponding env var is not set.                                                   |
 | `quick_models`            | object  | Map of quick-model names to `{ "provider", "model" }`. Can be switched with `/models <name>` or `--quick-model=<name>`.                                                      |
@@ -429,3 +436,42 @@ edit_system = "hashedit"
 Switching between modes is immediate and does not require agent restart.
 The `/editsys` `similarity` and `/editsys` `hashedit` slash commands
 provide the same functionality at runtime.
+
+## Prompt directives
+
+Custom prompt `.md` files may include a `%%mode=<mode>` directive on the
+**first line** to automatically switch the security mode when the prompt
+is activated (via `/prompt <name>` or as the `default_prompt`).
+
+Valid modes: `standard`, `restrictive`, `readonly`, `guarded`, `yolo`.
+
+Use `%%mode=last_user_mode` to keep (or restore) the mode the user last
+set explicitly via `/mode` or startup config — useful when a prompt wants
+to avoid overriding the user's chosen mode.
+
+The directive line is stripped from the prompt content before it reaches
+the agent.
+
+Example `ask.md`:
+
+```markdown
+%%mode=readonly
+
+## Read-Only Mode
+
+You are in read-only mode. Only read files and explore.
+```
+
+Example `code.md` that defers to the user's mode:
+
+```markdown
+%%mode=last_user_mode
+
+## Coding Mode
+
+Write well-tested code. Follow project conventions.
+```
+
+The mode change is applied when the prompt is activated and persists
+until changed again by `/mode`, another prompt directive, or a restart.
+The status bar shows `| mode:<name>` when the mode is not `standard`.

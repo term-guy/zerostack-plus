@@ -36,6 +36,8 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         "You respond concisely without showing your reasoning.\n\n"
     };
     let context_agents = context.agents.as_deref().unwrap_or("");
+    #[cfg(feature = "archmd")]
+    let context_architecture = context.architecture.as_deref().unwrap_or("");
     let context_prompt = context.current_prompt.as_deref().unwrap_or("");
     let cwd = std::env::current_dir()
         .ok()
@@ -58,6 +60,32 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         }
         + if !cwd.is_empty() { 30 + cwd.len() } else { 0 };
 
+    #[cfg(feature = "archmd")]
+    let total_len = total_len
+        + if context.architecture.is_some() {
+            2 + context_architecture.len()
+        } else {
+            0
+        };
+
+    #[cfg(feature = "memory")]
+    let total_len = total_len
+        + context.memory.as_deref().map_or(0, |m| m.len() + 8) // "\n\n---\n\n" + content
+        + crate::agent::prompt::MEMORY_TOOLS_PROMPT.len();
+
+    // Add extra files content to preamble budget
+    let extra_files_content: Vec<String> = context
+        .extra_files
+        .iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|content| format!("Content of {}:\n{}", p.display(), content))
+        })
+        .collect();
+    let extra_files_len: usize = extra_files_content.iter().map(|s| s.len() + 2).sum();
+    let total_len = total_len + extra_files_len;
+
     let mut preamble = String::with_capacity(total_len);
     preamble.push_str(reasoning_prefix);
     preamble.push_str(SYSTEM_PROMPT);
@@ -67,6 +95,11 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str("\n\n");
         preamble.push_str(context_agents);
     }
+    #[cfg(feature = "archmd")]
+    if !context_architecture.is_empty() {
+        preamble.push_str("\n\n");
+        preamble.push_str(context_architecture);
+    }
     if !context_prompt.is_empty() {
         preamble.push_str("\n\n---\n\n");
         preamble.push_str(context_prompt);
@@ -74,6 +107,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     if !cwd.is_empty() {
         preamble.push_str("\n\nCurrent working directory: ");
         preamble.push_str(&cwd);
+    }
+    for content in &extra_files_content {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(content);
+    }
+    #[cfg(feature = "memory")]
+    {
+        crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
+        preamble.push_str(crate::agent::prompt::MEMORY_TOOLS_PROMPT);
     }
 
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
@@ -124,12 +166,32 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
 
         let mut builder = builder.tools(base_tools.into_vec());
 
+        #[cfg(feature = "subagents")]
+        if cfg.task_enabled.unwrap_or(true) {
+            use crate::extras::subagents::task_tool::TaskTool;
+            builder = builder.tool(TaskTool::new(permission.clone(), ask_tx.clone()));
+        }
+
+        #[cfg(feature = "memory")]
+        {
+            use crate::extras::memory::{MemoryRead, MemorySearch, MemoryWrite};
+            builder = builder
+                .tool(MemoryWrite::new(permission.clone(), ask_tx.clone()))
+                .tool(MemoryRead::new(permission.clone(), ask_tx.clone()))
+                .tool(MemorySearch::new(permission.clone(), ask_tx.clone()));
+        }
+
         #[cfg(feature = "mcp")]
         if let Some(manager) = &mcp_manager {
             let allow_all = cfg.allow_all_mcp_calls.unwrap_or(false);
-            let mcp_permission = if allow_all { None } else { permission.clone() };
-            let mcp_ask_tx = if allow_all { None } else { ask_tx.clone() };
-            let mcp_tools = manager.collect_tools(mcp_permission, mcp_ask_tx).await;
+            if allow_all && let Some(ref perm) = permission {
+                perm.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_allow_all_mcp_calls(true);
+            }
+            let mcp_tools = manager
+                .collect_tools(permission.clone(), ask_tx.clone())
+                .await;
             if !mcp_tools.is_empty() {
                 let dyn_tools: Vec<Box<dyn rig::tool::ToolDyn>> = mcp_tools
                     .into_iter()

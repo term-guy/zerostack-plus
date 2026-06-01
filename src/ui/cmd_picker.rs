@@ -8,6 +8,11 @@ use crossterm::terminal::Clear;
 use super::utils::resolve_color;
 
 const COMMANDS: &[&str] = &[
+    "/add",
+    "/drop",
+    "/drop-all",
+    "/init",
+    "/memory",
     "/model",
     "/models",
     "/models-add",
@@ -34,9 +39,12 @@ const COMMANDS: &[&str] = &[
     "/undo",
     "/retry",
     "/help",
+    "/welcome",
+    "/tutorial",
     "/worktree",
     "/wt-merge",
     "/wt-exit",
+    "/btw",
 ];
 
 pub struct CommandPicker {
@@ -214,6 +222,7 @@ impl CommandPicker {
 }
 
 pub struct PromptPicker {
+    pub prefix: &'static str,
     pub active: bool,
     pub query: String,
     pub cursor: usize,
@@ -226,6 +235,20 @@ pub struct PromptPicker {
 impl PromptPicker {
     pub fn new() -> Self {
         PromptPicker {
+            prefix: "/prompt ",
+            active: false,
+            query: String::new(),
+            cursor: 0,
+            matches: Vec::new(),
+            selected: 0,
+            items: Vec::new(),
+            monochrome: false,
+        }
+    }
+
+    pub fn with_prefix(prefix: &'static str) -> Self {
+        PromptPicker {
+            prefix,
             active: false,
             query: String::new(),
             cursor: 0,

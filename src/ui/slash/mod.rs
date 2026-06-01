@@ -1,6 +1,9 @@
+mod add;
 mod content;
 mod features;
 mod help;
+mod init;
+mod memory;
 mod providers;
 mod session;
 mod settings;
@@ -192,6 +195,12 @@ pub async fn handle_compress(
         .map(|m| m.estimated_tokens)
         .sum();
 
+    #[cfg(feature = "memory")]
+    crate::extras::memory::flush_compaction_summary(
+        &crate::extras::memory::Mem::open(),
+        &summary,
+        Some(cut_idx), // = first_kept_index: how many messages were summarized
+    );
     session.compress(summary, cut_idx, tokens_before);
 
     let model = client.completion_model(session.model.to_string());
@@ -269,9 +278,8 @@ pub async fn handle_slash(
     };
 
     match parts[0] {
-        "/provider" | "/model" | "/models" | "/models-add" => {
-            providers::handle(&parts, &mut ctx).await
-        }
+        "/provider" | "/model" | "/models" | "/models-add" | "/model-subagent"
+        | "/models-subagent" => providers::handle(&parts, &mut ctx).await,
         "/prompt" | "/theme" | "/regen-prompts" | "/regen-themes" => {
             content::handle(&parts, &mut ctx).await
         }
@@ -285,6 +293,13 @@ pub async fn handle_slash(
             help::handle(&parts, &mut ctx);
             Ok(())
         }
+        "/welcome" | "/tutorial" => {
+            help::handle_welcome(ctx.renderer);
+            Ok(())
+        }
+        "/add" | "/drop" | "/drop-all" => add::handle(&parts, &mut ctx).await,
+        "/init" => init::handle(&parts, &mut ctx).await,
+        "/memory" => memory::handle(&parts, &mut ctx).await,
         "/compress" | "/compact" | "/loop" | "/worktree" | "/wt-merge" | "/wt-exit" => {
             features::handle(&parts, &mut ctx).await
         }

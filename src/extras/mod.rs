@@ -9,3 +9,14 @@ pub mod mcp;
 
 #[cfg(feature = "acp")]
 pub mod acp;
+
+#[cfg(feature = "memory")]
+pub mod memory;
+
+#[cfg(feature = "subagents")]
+pub mod subagents;
+
+#[cfg(feature = "archmd")]
+pub mod archmd;
+
+pub(crate) mod truncate;

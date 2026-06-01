@@ -45,6 +45,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub always_show_welcome: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_providers: Option<HashMap<String, types::CustomProviderConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission: Option<serde_json::Value>,
@@ -70,6 +72,8 @@ pub struct Config {
     pub allow_all_mcp_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_permission_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "permission-modes")]
+    pub permission_modes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_tool_details: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,6 +84,10 @@ pub struct Config {
     #[cfg(feature = "git-worktree")]
     #[serde(skip_serializing_if = "Option::is_none", rename = "wt-base-dir")]
     pub wt_base_dir: Option<String>,
+
+    #[cfg(feature = "git-worktree")]
+    #[serde(skip_serializing_if = "Option::is_none", rename = "wt-force")]
+    pub wt_force: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,6 +110,20 @@ pub struct Config {
     pub acp_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edit_system: Option<types::EditSystem>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_max_turns: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny_repeated_reads: Option<bool>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_enabled: Option<bool>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_model: Option<CompactString>,
+    #[cfg(feature = "subagents")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subagent_provider: Option<CompactString>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub colors: Option<types::ColorsConfig>,
 }
@@ -125,6 +147,10 @@ impl Config {
 
     pub fn resolve_compact_enabled(&self) -> bool {
         self.compact_enabled.unwrap_or(true)
+    }
+
+    pub fn resolve_always_show_welcome(&self) -> bool {
+        self.always_show_welcome.unwrap_or(false)
     }
 
     pub fn build_permission_config(&self) -> PermissionConfigs {

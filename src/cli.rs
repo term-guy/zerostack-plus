@@ -4,7 +4,7 @@ use compact_str::CompactString;
 use crate::config;
 use crate::config::types::EditSystem;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Default)]
 #[command(name = "zerostack", version, about = "Minimal coding agent")]
 pub struct Cli {
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
@@ -16,10 +16,10 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue", help = "Continue most recent session")]
     pub continue_session: bool,
 
-    #[arg(short = 'r', long = "resume", help = "Browse and select a session")]
+    #[arg(short = 'r', long = "resume", help = "List recent sessions")]
     pub resume: bool,
 
-    #[arg(long = "session", help = "Use specific session file or ID")]
+    #[arg(long = "session", help = "Load session by ID prefix")]
     pub session: Option<String>,
 
     #[arg(long = "no-session", help = "Ephemeral mode, do not save")]
@@ -58,12 +58,14 @@ pub struct Cli {
     #[arg(long = "no-color", help = "Disable colored TUI output")]
     pub no_color: bool,
 
-    #[arg(
-        long = "restrictive",
-        short = 'R',
-        help = "Default all tools to ask for approval"
-    )]
+    #[arg(long = "restrictive", short = 'R', help = "Ask for all operations")]
     pub restrictive: bool,
+
+    #[arg(long = "read-only", help = "Allow reads only, deny everything else")]
+    pub read_only: bool,
+
+    #[arg(long = "guarded", help = "Allow reads, ask for all other operations")]
+    pub guarded: bool,
 
     #[arg(
         long = "accept-all",
@@ -73,9 +75,15 @@ pub struct Cli {
 
     #[arg(
         long = "yolo",
-        help = "Auto-accept ALL operations without any restriction"
+        help = "Allow all operations except destructive bash commands"
     )]
     pub yolo: bool,
+
+    #[arg(
+        long = "dangerously-skip-permissions",
+        help = "Skip all permission checks (allow everything without any guard)"
+    )]
+    pub dangerously_skip_permissions: bool,
 
     #[arg(
         long = "sandbox",
@@ -104,7 +112,7 @@ pub struct Cli {
     #[arg(
         long = "no-context-files",
         short = 'n',
-        help = "Disable AGENTS.md loading"
+        help = "Disable AGENTS.md and ARCHITECTURE.md loading"
     )]
     pub no_context_files: bool,
 
@@ -171,6 +179,13 @@ pub struct Cli {
     )]
     pub wt_base_dir: Option<String>,
 
+    #[cfg(feature = "git-worktree")]
+    #[arg(
+        long = "wt-force",
+        help = "Force worktree remove and branch delete even if dirty"
+    )]
+    pub wt_force: bool,
+
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
 }
@@ -189,7 +204,12 @@ impl Cli {
             .as_deref()
             .or(cfg.model.as_deref())
             .map(CompactString::new)
-            .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-flash"))
+            .unwrap_or_else(|| {
+                let qm = config::quick_models_map(cfg);
+                qm.get("deepseek-v4-flash")
+                    .map(|q| q.model.clone())
+                    .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-flash"))
+            })
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
@@ -197,7 +217,12 @@ impl Cli {
             .as_deref()
             .or(cfg.provider.as_deref())
             .map(CompactString::new)
-            .unwrap_or_else(|| CompactString::new("openrouter"))
+            .unwrap_or_else(|| {
+                let qm = config::quick_models_map(cfg);
+                qm.get("deepseek-v4-flash")
+                    .map(|q| q.provider.clone())
+                    .unwrap_or_else(|| CompactString::new("openrouter"))
+            })
     }
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
@@ -253,5 +278,10 @@ impl Cli {
             .clone()
             .or_else(|| cfg.wt_base_dir.clone())
             .map(std::path::PathBuf::from)
+    }
+
+    #[cfg(feature = "git-worktree")]
+    pub fn resolve_wt_force(&self, cfg: &config::Config) -> bool {
+        self.wt_force || cfg.wt_force.unwrap_or(false)
     }
 }

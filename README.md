@@ -1,12 +1,20 @@
+![banner](https://github.com/gi-dellav/zerostack/blob/main/assets/banner.png?raw=true)
+
+---
+
 # zerostack-plus
 
 Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/latest/usage) and [opencode](https://opencode.ai/). A fork of [zerostack](https://github.com/gi-dellav/zerostack) with additional provider support.
+
+*blogposts:* [what we built in 2 weeks](https://rocketup.pages.dev/posts/what_we_built_in_2_weeks/)
+
+<a href="https://www.producthunt.com/products/zerostack-coding-agent/reviews/new?utm_source=badge-product_review&utm_medium=badge&utm_source=badge-zerostack&#0045;coding&#0045;agent" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1236867&theme=light" alt="Zerostack&#0032;Coding&#0032;Agent - A&#0032;minimal&#0032;coding&#0032;agent&#0044;&#0032;with&#0032;a&#0032;bundle&#0032;of&#0032;innovative&#0032;features | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
 
 ## Features
 
 - **Multi-provider**: OpenRouter, OpenAI, Anthropic, Gemini, Ollama, DeepSeek, plus custom providers
 - **Standard tools**: all of the standard tools exposed to coding agents, as described by the opencode documentation.
-- **Permission system**: four configurable modes with per-tool patterns, session allowlists, and external directory policies
+- **Permission system**: five configurable modes with per-tool patterns, session allowlists, and configurable mode-to-rule application policies
 - **Session management**: save/load/resume sessions, auto-compaction to stay within context windows
 - **Terminal UI**: crossterm-based, markdown rendering, mouse selection/copy, scrollback, reasoning visibility toggle
 - **Prompts system**: switch between system prompt modes at runtime (`code`, `plan`, `review`, `debug`, etc.) to tailor the agent's behavior to the task without having to manage Skills.
@@ -15,6 +23,9 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Integrated Ralph Wiggum loops**: looping capabilities for long-horizon tasks
 - **Integrated Git Worktrees integration**: Use `/worktree` to move the agent from one worktree to another.
 - **ACP support** (gated): Agent Communication Protocol server — lets editors (Zed, etc.) connect to zerostack as an ACP agent
+- **Persistent memory** (gated): plain-Markdown memory across sessions: a global MEMORY.md plus per-project daily logs, scratchpad, and notes, injected into the system prompt each session
+- **Subagents**: Parallel and fast, used for exploring the codebase
+- **ARCHITECTURE.md**: Our own companion file for AGENTS.md, it allows to offer a shared core knowledge for all agents working on the same codebase
 
 **NOTE**: Windows support is not tested is any way, but feel free to try and open an issue if you encounter any bugs!
 
@@ -22,8 +33,8 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 
 _zerostack-plus_ is one of the smallest and most performant coding agents on the market.
 
-- Lines of code: ~12k LoC
-- Binary size: 12.9MB
+- Lines of code: ~16k LoC
+- Binary size: 26MB
 - RAM footprint: ~16MB on average, with peaks at ~24MB (vs ~300MB with peaks at ~700MB for opencode or other JS-based coding agents)
 - CPU usage: 0.0% on idle, ~1.5% when using tools (measured on an Intel i5 7th gen, vs ~2% on idle and ~20% when working for opencode)
 
@@ -40,13 +51,19 @@ cargo install --git https://github.com/term-guy/zerostack-plus --features acp
 
 # All features
 cargo install --git https://github.com/term-guy/zerostack-plus --features "acp,loop,git-worktree,mcp"
+
+# With Memory support
+cargo install zerostack --features memory
+
+# With experimental multi-threaded subagents
+cargo install zerostack --features multithread
 ```
 
 You are now ready to work with a lightweight coding agent! (You can also find pre-built binaries on Github Releases)
 
 Once installed, run `/prompt autoconfig` inside zerostack to explore the documentation and configure the tool interactively.
 
-*note:* If you have questions or you want to collaborate on the project, please join the [dedicated Matrix chatroom](https://app.element.io/#/room/#zerostack-general:matrix.org).
+_note:_ If you have questions or you want to collaborate on the project, please join the [dedicated Matrix chatroom](https://app.element.io/#/room/#zerostack-general:matrix.org).
 
 ### Optional: sandbox mode
 
@@ -64,6 +81,8 @@ dnf install bubblewrap
 # Arch
 pacman -S bubblewrap
 ```
+
+There is also support for zerobox as an alternative sandbox backend.
 
 ## Quick start
 
@@ -100,8 +119,8 @@ You can run `/prompt autoconfig` in order to use a specialized agent that allows
 
 ## Prompts system
 
-_zerostack-plus_ includes a set of built-in system prompts that change the agent's behavior and tone.  
-The idea is to build a complete suite of prompts that can fully substitute skills like [superpower](https://github.com/obra/superpowers) or the [Claude's official skills](https://github.com/anthropics/claude-plugins-official/tree/main).  
+_zerostack-plus_ includes a set of built-in system prompts that change the agent's behavior and tone.
+The idea is to build a complete suite of prompts that can fully substitute skills like [superpower](https://github.com/obra/superpowers) or the [Claude's official skills](https://github.com/anthropics/claude-plugins-official/tree/main).
 You can switch between different prompts or list all registered prompts using `/prompt`.
 
 Built-in prompts:
@@ -113,7 +132,7 @@ Built-in prompts:
 | **`plan`**            | Planning-only mode — explores and produces a plan without writing code   |
 | **`review`**          | Code review mode — reviews for correctness, design, testing, and impact  |
 | **`debug`**           | Debug mode — finds root cause before proposing fixes                     |
-| **`ask`**             | Read-only mode — only read/grep/glob permitted, no writes or bash        |
+| **`ask`**             | Read-only mode — only read/grep/find_files permitted, no writes or bash        |
 | **`brainstorm`**      | Design-only mode — explores ideas and presents designs without code      |
 | **`frontend-design`** | Frontend design mode — distinctive, production-grade UI                  |
 | **`review-security`** | Security review mode — finds exploitable vulnerabilities                 |
@@ -125,19 +144,25 @@ You can also create custom prompts by placing markdown files in
 
 Additionally, the agent automatically loads `AGENTS.md` or `CLAUDE.md` from the
 project root or any ancestor directory, injecting their contents into the
-system prompt. Use `-n` / `--no-context-files` to disable this.
+system prompt. When enabled (feature `archmd`), `ARCHITECTURE.md` is also loaded
+the same way, providing high-level design context to speed up exploration.
+Use `-n` / `--no-context-files` to disable all context file loading.
 
 ## Permission system
 
-zerostack-plus has four permission modes, from safest to most permissive:
+zerostack-plus has five permission modes, from safest to most permissive:
 
-1. **restrictive** (`-R`): every tool action prompts for approval unless
-   explicitly allowed in config
-2. **standard** (default): safe commands (ls, cd, git log, cargo check) are
-   auto-approved; writes and destructive operations ask
-3. **accept-all** (`--accept-all`): auto-approves all operations inside the
-   working directory; external paths prompt for confirmation
-4. **yolo** (`--yolo`): auto-approves everything without prompting
+| Mode | CLI flag | Behavior |
+|------|----------|----------|
+| **restrictive** | `-R` / `--restrictive` | Ask for every operation. Config rules are ignored by default (can be enabled via `permission-modes`). |
+| **readonly** | `--read-only` | Allow read/grep/find_files/list_dir. Deny writes, edits, bash, and everything else. Config rules ignored by default. |
+| **guarded** | `--guarded` | Allow read tools. Ask for writes, edits, bash, and everything else. Config rules apply. |
+| **standard** | (default) | Allow path tools (read/write/edit/list_dir) within CWD and subdirectories. Safe bash commands (ls, cat, git log, cargo check) auto-allowed. Ask for external paths and unrecognized commands. Config rules apply and override mode defaults. |
+| **yolo** | `--yolo` | Allow everything, but prompt for destructive bash commands (rm, dd, mkfs, etc.). Config rules apply. |
+
+The `--dangerously-skip-permissions` flag completely bypasses all permission
+checks, allowing every tool operation without any guard. This is not a mode
+and cannot be toggled at runtime.
 
 Permissions can be configured per-tool with granular glob patterns in the
 config file. For example, you can allow `write **.rs` automatically while
@@ -169,6 +194,23 @@ To see all of the commands, use `/help`.
 Sessions are saved to `$XDG_DATA_HOME/zerostack/sessions/`. Use `-c` to
 resume the most recent session, `-r` to browse and select one, or
 `--session <id>` to load a specific session.
+
+## Memory
+
+**NOTE:** Memory is gated behind the `memory` feature and is not included in the
+default build. Install with `cargo install zerostack --features memory`.
+
+With the `memory` feature, zerostack keeps plain-Markdown notes on disk and
+injects the relevant ones into the system prompt at the start of every session,
+so it remembers your preferences and recent context across runs.
+
+Global memory files are stored in `$XDG_DATA_HOME/zerostack/agent/memory/`.
+
+## Parallel Agent
+
+If you want to make multiple agents work on the same repository without having to work with git worktrees,
+zerostack now ships with `--parallel`, which enables full management of a temporary git worktree that will
+be merged and removed before exiting the agent. 
 
 ## Loop system
 

@@ -25,6 +25,46 @@ pub(crate) fn edit_system() -> EditSystem {
     *EDIT_SYSTEM.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+static DENY_REPEATED_READS: Mutex<bool> = Mutex::new(true);
+
+pub(crate) fn set_deny_repeated_reads(v: bool) {
+    *DENY_REPEATED_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = v;
+}
+
+pub(crate) fn deny_repeated_reads() -> bool {
+    *DENY_REPEATED_READS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+static READ_TRACKER: Mutex<Vec<(String, usize, usize)>> = Mutex::new(Vec::new());
+
+pub(crate) fn track_read(path: &str, offset: usize, limit: usize) -> Option<String> {
+    if !deny_repeated_reads() {
+        return None;
+    }
+    let mut tracker = READ_TRACKER.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (path.to_string(), offset, limit);
+    if tracker.contains(&key) {
+        let end = (offset + limit).saturating_sub(1);
+        Some(format!(
+            "read blocked: {path} (lines {}-{}) was already read and has not been modified since. Use the previous result or read a different section.",
+            offset + 1,
+            if end > 0 { end } else { offset + 1 }
+        ))
+    } else {
+        tracker.push(key);
+        None
+    }
+}
+
+pub(crate) fn untrack_read_path(path: &str) {
+    let mut tracker = READ_TRACKER.lock().unwrap_or_else(|e| e.into_inner());
+    tracker.retain(|(p, _, _)| p != path);
+}
+
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use find_files::FindFilesTool;
@@ -162,16 +202,17 @@ pub async fn check_perm(
     ask_tx: &Option<AskSender>,
     tool: &str,
     input_key: &str,
-) -> Result<(), ToolError> {
+) -> Result<Option<String>, ToolError> {
     let Some(perm) = permission else {
-        return Ok(());
+        return Ok(None);
     };
     let result = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check(tool, input_key)
     };
     match result {
-        CheckResult::Allowed => Ok(()),
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
         CheckResult::Denied(reason) => {
             Err(ToolError::Msg(format!("Permission denied: {}", reason)))
         }
@@ -181,7 +222,8 @@ pub async fn check_perm(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, input_key).await
+            handle_ask_inner(tx, perm, tool, input_key).await?;
+            Ok(None)
         }
     }
 }
@@ -191,16 +233,17 @@ pub async fn check_perm_path(
     ask_tx: &Option<AskSender>,
     tool: &str,
     path: &str,
-) -> Result<(), ToolError> {
+) -> Result<Option<String>, ToolError> {
     let Some(perm) = permission else {
-        return Ok(());
+        return Ok(None);
     };
     let result = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.check_path(tool, path)
     };
     match result {
-        CheckResult::Allowed => Ok(()),
+        CheckResult::Allowed => Ok(None),
+        CheckResult::AllowedWithCoaching(msg) => Ok(Some(msg)),
         CheckResult::Denied(reason) => {
             Err(ToolError::Msg(format!("Permission denied: {}", reason)))
         }
@@ -210,7 +253,8 @@ pub async fn check_perm_path(
                     "Permission denied (non-interactive mode)".to_string(),
                 ));
             };
-            handle_ask_inner(tx, perm, tool, path).await
+            handle_ask_inner(tx, perm, tool, path).await?;
+            Ok(None)
         }
     }
 }

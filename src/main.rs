@@ -32,13 +32,20 @@ fn resolve_mode(cli: &cli::Cli, cfg: &config::Config) -> SecurityMode {
     if cli.yolo || cfg.yolo.unwrap_or(false) {
         SecurityMode::Yolo
     } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        SecurityMode::Accept
+        SecurityMode::Standard
+    } else if cli.read_only {
+        SecurityMode::ReadOnly
+    } else if cli.guarded {
+        SecurityMode::Guarded
     } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
         SecurityMode::Restrictive
     } else if let Some(m) = &cfg.default_permission_mode {
         match m.as_str() {
             "yolo" => SecurityMode::Yolo,
-            "accept" => SecurityMode::Accept,
+            "accept" => SecurityMode::Standard,
+            "standard" => SecurityMode::Standard,
+            "guarded" => SecurityMode::Guarded,
+            "readonly" => SecurityMode::ReadOnly,
             "restrictive" => SecurityMode::Restrictive,
             _ => SecurityMode::Standard,
         }
@@ -60,17 +67,26 @@ fn build_permission_checker(
         return (None, None, None);
     }
 
+    if cli.dangerously_skip_permissions {
+        return (None, None, None);
+    }
+
     let perm_config = cfg.build_permission_config();
 
     let mode = resolve_mode(cli, cfg);
-    let checker = PermissionChecker::new(&perm_config, mode, None);
+    let permission_modes = cfg.permission_modes.clone();
+    let checker = PermissionChecker::new(&perm_config, mode, None, permission_modes);
     let perm: PermCheck = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);
     (Some(perm), Some(ask_tx), Some(ask_rx))
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[cfg_attr(
+    feature = "multithread",
+    tokio::main(flavor = "multi_thread", worker_threads = 4)
+)]
+#[cfg_attr(not(feature = "multithread"), tokio::main(flavor = "current_thread"))]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -87,14 +103,66 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if cli.resume && cli.session.is_none() {
+        print_sessions();
+        return Ok(());
+    }
+
     let _ = docs::ensure_global();
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
 
-    let default_prompt = cfg.default_prompt.as_deref().unwrap_or("code");
-    if let Some(content) = context.prompts.get(default_prompt) {
-        context.current_prompt = Some(content.clone());
-        context.current_prompt_name = Some(default_prompt.to_string());
+    #[cfg(feature = "archmd")]
+    let arch_created = if !cli.resolve_no_context_files(&cfg) {
+        let cwd = std::env::current_dir().ok();
+        if let Some(ref cwd) = cwd {
+            crate::extras::archmd::ask_and_create(cwd).unwrap_or_else(|e| {
+                tracing::warn!("Architecture.md prompt failed: {e}");
+                false
+            })
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Reload context after potential ARCHITECTURE.md creation
+    #[cfg(feature = "archmd")]
+    {
+        context.architecture = crate::context::load_architecture();
     }
+
+    let default_prompt = cfg.default_prompt.as_deref().unwrap_or("code");
+    let default_prompt_mode: Option<&str> = if let Some(content) =
+        context.prompts.get(default_prompt)
+    {
+        let (mode_directive, clean_content) = crate::permission::parse_prompt_mode(content);
+        let mut prompt_text = if mode_directive.is_some() {
+            clean_content.to_string()
+        } else {
+            content.clone()
+        };
+
+        // Append available capabilities based on enabled features
+        #[allow(unused_mut)]
+        let mut caps: Vec<&str> = Vec::new();
+        #[cfg(feature = "memory")]
+            caps.push("- **Memory**: persistent memory across sessions (memory_read, memory_write, memory_search)");
+        #[cfg(feature = "subagents")]
+            caps.push("- **Subagents**: delegate specific multi-step investigations to parallel subagents via the `task` tool");
+
+        if !caps.is_empty() {
+            prompt_text.push_str("\n\n## Available Capabilities\n\n");
+            prompt_text.push_str(&caps.join("\n"));
+            prompt_text.push('\n');
+        }
+
+        context.current_prompt = Some(prompt_text);
+        context.current_prompt_name = Some(default_prompt.to_string());
+        mode_directive
+    } else {
+        None
+    };
 
     let mut provider = cli.resolve_provider(&cfg);
     let mut model = cli.resolve_model(&cfg);
@@ -107,7 +175,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Custom provider model override (if no explicit model set)
     if let Some(custom) = cfg.custom_providers_map().get(provider.as_str())
-        && (model.as_str() == "deepseek/deepseek-v4-flash" || cli.model.is_none())
+        && cli.model.is_none()
+        && cfg.model.is_none()
         && let Some(ref custom_model) = custom.model
     {
         model = custom_model.clone();
@@ -115,33 +184,18 @@ async fn main() -> anyhow::Result<()> {
 
     let mut session = session::Session::new(&provider, &model, cfg.resolve_context_window());
 
-    if cli.resume && cli.session.is_none() && !cli.continue_session {
-        let sessions = session::storage::find_recent_sessions(10)?;
-        if sessions.is_empty() {
-            eprintln!("No recent sessions found.");
-        } else {
-            eprintln!("Recent sessions:");
-            for (i, s) in sessions.iter().enumerate() {
-                let preview = s
-                    .messages
-                    .last()
-                    .map(|m| {
-                        let truncated: String = m.content.chars().take(60).collect();
-                        truncated
-                    })
-                    .unwrap_or_default();
-                eprintln!(
-                    "  {}. {}  [{} msgs] {}",
-                    i + 1,
-                    &s.id[..8],
-                    s.messages.len(),
-                    preview
-                );
-            }
-            if let Some(s) = sessions.into_iter().next() {
-                session = s;
-            }
-        }
+    // Resolve input/output token costs from quick models or defaults
+    let qm_map = config::quick_models_map(&cfg);
+    if let Some(qm) = cli.resolve_quick_model(&cfg) {
+        session.input_token_cost = qm.input_token_cost;
+        session.output_token_cost = qm.output_token_cost;
+    } else if let Some(qm) = qm_map
+        .iter()
+        .find(|(_, v)| v.model.as_str() == model && v.provider.as_str() == provider)
+        .map(|(_, v)| v)
+    {
+        session.input_token_cost = qm.input_token_cost;
+        session.output_token_cost = qm.output_token_cost;
     }
 
     if cli.continue_session
@@ -153,7 +207,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(session_id) = &cli.session {
-        session = session::storage::load_session(session_id)?;
+        let sessions = session::storage::find_sessions_by_prefix(session_id)?;
+        if sessions.is_empty() {
+            anyhow::bail!("no session matching '{}'", session_id);
+        } else if sessions.len() == 1 {
+            session = sessions.into_iter().next().unwrap();
+        } else {
+            eprintln!("multiple sessions match '{}':", session_id);
+            for s in &sessions {
+                let preview = s
+                    .messages
+                    .last()
+                    .map(|m| {
+                        let truncated: String = m.content.chars().take(40).collect();
+                        truncated
+                    })
+                    .unwrap_or_default();
+                let time = crate::ui::events::format_time(&s.updated_at);
+                eprintln!(
+                    "  {}  {}  {}msgs  {}  {}",
+                    &s.id[..8],
+                    time,
+                    s.messages.len(),
+                    s.model,
+                    preview
+                );
+            }
+            anyhow::bail!("be more specific with the session ID prefix");
+        }
     }
 
     let client = provider::create_client(
@@ -162,6 +243,50 @@ async fn main() -> anyhow::Result<()> {
         &cfg.custom_providers_map(),
         cfg.api_keys.as_ref(),
     )?;
+
+    #[cfg(feature = "subagents")]
+    {
+        let task_max_turns = cfg.task_max_turns.unwrap_or(15);
+        let qm = config::quick_models_map(&cfg);
+
+        // Resolve subagent model: subagent_model config > subagent_provider + model > deepseek-v4-flash quick model
+        let (sub_provider, sub_model) = if let Some(sa_model) = &cfg.subagent_model {
+            if let Some(q) = qm.get(sa_model.as_str()) {
+                (q.provider.clone(), q.model.clone())
+            } else {
+                let prov = cfg
+                    .subagent_provider
+                    .clone()
+                    .unwrap_or_else(|| provider.clone());
+                (prov, sa_model.clone())
+            }
+        } else if let Some(sa_prov) = &cfg.subagent_provider {
+            (sa_prov.clone(), model.clone())
+        } else if let Some(dsv4) = qm.get("deepseek-v4-flash") {
+            (dsv4.provider.clone(), dsv4.model.clone())
+        } else {
+            (provider.clone(), model.clone())
+        };
+
+        let sub_client = if sub_provider.as_str() == provider {
+            client.clone()
+        } else {
+            crate::provider::create_client(
+                &sub_provider,
+                cli.api_key.as_deref(),
+                &cfg.custom_providers_map(),
+                cfg.api_keys.as_ref(),
+            )?
+        };
+
+        crate::extras::subagents::init(
+            sub_client,
+            sub_model.to_string(),
+            task_max_turns,
+            #[cfg(feature = "archmd")]
+            context.architecture.clone(),
+        );
+    }
 
     #[cfg(feature = "acp")]
     if cli.acp_enabled {
@@ -175,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
     .with_shell(&cli.resolve_shell(&cfg));
     let edit_system = cli.resolve_edit_system(&cfg);
     tools::set_edit_system(edit_system);
+    tools::set_deny_repeated_reads(cfg.deny_repeated_reads.unwrap_or(true));
     let (permission, ask_tx, ask_rx) = build_permission_checker(&cli, &cfg);
 
     if let Some(perm) = &permission {
@@ -183,39 +309,103 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|e| (e.tool.to_string(), e.pattern.to_string()))
             .collect();
-        perm.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .load_session_allowlist(&allowlist);
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        guard.load_session_allowlist(&allowlist);
+        // Apply mode from prompt %%mode= directive (if any)
+        if let Some(mode_str) = default_prompt_mode
+            && mode_str != "last_user_mode"
+            && let Some(mode) = SecurityMode::from_str(mode_str)
+        {
+            guard.set_prompt_mode(mode);
+        }
     }
 
     let completion_model = client.completion_model(model.to_string());
 
-    if cli.print {
-        let agent = provider::build_agent(
-            completion_model,
-            &cli,
-            &cfg,
-            &context,
-            permission,
-            ask_tx,
-            sandbox.clone(),
-            true,
-            #[cfg(feature = "mcp")]
-            None,
+    #[cfg(feature = "archmd")]
+    let arch_msg: Option<String> = if arch_created {
+        Some(
+            "I've just created an empty ARCHITECTURE.md template at the project root. \
+            Explore the codebase thoroughly using the `task` tool (delegating parallel exploration to subagents) \
+            and fill ARCHITECTURE.md with a high-level architecture document covering:\n\
+            - Directory layout and module responsibilities\n\
+            - Key types, traits, and their relationships\n\
+            - Control flow (how requests/events flow through the system)\n\
+            - Data flow (how data is transformed from input to output)\n\
+            - Design decisions and rationale\n\
+            - External dependencies and how they are used\n\
+            - Entry points for different execution modes\n\n\
+            Keep the document under ~300 lines of code total. Keep entries concise and reference specific source files."
+                .to_string(),
         )
-        .await;
+    } else {
+        None
+    };
+    #[cfg(not(feature = "archmd"))]
+    let arch_msg: Option<String> = None;
+
+    if cli.print {
         let msg = cli.message.join(" ");
-        let response = agent
-            .run_print(&msg, cli.resolve_max_agent_turns(&cfg))
-            .await?;
-        if !cli.no_session {
-            session.add_message(MessageRole::User, &msg);
-            session.add_message(MessageRole::Assistant, &response);
-            session::storage::save_session(&session)?;
-            let _ = session::chat_history::append_entry(&session::chat_history::ChatHistoryEntry {
-                content: msg,
-                timestamp: session.updated_at.clone(),
-            });
+        if msg.starts_with('!') {
+            let cmd = msg.strip_prefix('!').map(|s| s.trim()).unwrap_or("");
+            if !cmd.is_empty() {
+                let output = std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output()?;
+                let mut result = String::new();
+                if !output.stdout.is_empty() {
+                    result.push_str(&String::from_utf8_lossy(&output.stdout));
+                }
+                if !output.stderr.is_empty() {
+                    if !result.is_empty() {
+                        result.push('\n');
+                    }
+                    result.push_str(&String::from_utf8_lossy(&output.stderr));
+                }
+                let result = result.trim().to_string();
+                println!("{}", result);
+                if !cli.no_session {
+                    session.add_message(MessageRole::User, &msg);
+                    session.add_message(MessageRole::Assistant, &result);
+                    session::storage::save_session(&session)?;
+                    let _ = session::chat_history::append_entry(
+                        &session::chat_history::ChatHistoryEntry {
+                            content: msg,
+                            timestamp: session.updated_at.clone(),
+                        },
+                    );
+                }
+            } else {
+                eprintln!("error: empty command after '!'");
+            }
+        } else {
+            let agent = provider::build_agent(
+                completion_model,
+                &cli,
+                &cfg,
+                &context,
+                permission,
+                ask_tx,
+                sandbox.clone(),
+                true,
+                #[cfg(feature = "mcp")]
+                None,
+            )
+            .await;
+            let response = agent
+                .run_print(&msg, cli.resolve_max_agent_turns(&cfg))
+                .await?;
+            if !cli.no_session {
+                session.add_message(MessageRole::User, &msg);
+                session.add_message(MessageRole::Assistant, &response);
+                session::storage::save_session(&session)?;
+                let _ =
+                    session::chat_history::append_entry(&session::chat_history::ChatHistoryEntry {
+                        content: msg,
+                        timestamp: session.updated_at.clone(),
+                    });
+            }
         }
     } else {
         #[cfg(feature = "loop")]
@@ -261,6 +451,7 @@ async fn main() -> anyhow::Result<()> {
             ask_tx,
             ask_rx,
             sandbox,
+            arch_msg,
         )
         .await?;
     }
@@ -275,6 +466,42 @@ fn print_section(title: &str, entries: &[(&str, String)]) {
         println!("  {k:<width$}  {v}");
     }
     println!();
+}
+
+fn print_sessions() {
+    let sessions = match session::storage::find_recent_sessions(20) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error listing sessions: {e}");
+            return;
+        }
+    };
+    if sessions.is_empty() {
+        println!("no saved sessions");
+    } else {
+        println!("recent sessions ({}):", sessions.len());
+        for s in &sessions {
+            let last = s
+                .messages
+                .last()
+                .map(|m| {
+                    let truncated: String = m.content.chars().take(30).collect();
+                    format!("...{truncated}")
+                })
+                .unwrap_or_default();
+            let time = crate::ui::events::format_time(&s.updated_at);
+            println!(
+                "  {}  {}  {}msgs  {}  {}",
+                &s.id[..8],
+                time,
+                s.messages.len(),
+                s.model,
+                last
+            );
+        }
+        println!();
+        println!("Use --session <id> to load a session by its ID prefix.");
+    }
 }
 
 fn print_config(cli: &cli::Cli, cfg: &config::Config) {
@@ -296,10 +523,16 @@ fn print_config(cli: &cli::Cli, cfg: &config::Config) {
     let edit_system = cli.resolve_edit_system(cfg);
     let compact = cfg.resolve_compact_enabled();
 
-    let mode = if cli.yolo || cfg.yolo.unwrap_or(false) {
+    let mode = if cli.dangerously_skip_permissions {
+        "dangerously-skip-permissions"
+    } else if cli.yolo || cfg.yolo.unwrap_or(false) {
         "yolo"
     } else if cli.accept_all || cfg.accept_all.unwrap_or(false) {
-        "accept"
+        "standard"
+    } else if cli.read_only {
+        "readonly"
+    } else if cli.guarded {
+        "guarded"
     } else if cli.restrictive || cfg.restrictive.unwrap_or(false) {
         "restrictive"
     } else {

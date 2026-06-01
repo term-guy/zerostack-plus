@@ -11,6 +11,10 @@ pub enum AgentEvent {
     ToolResult {
         output: CompactString,
     },
+    SubagentToolCall {
+        name: CompactString,
+        args: serde_json::Value,
+    },
     Error(CompactString),
     Done {
         response: CompactString,
@@ -24,7 +28,7 @@ pub enum UserEvent {
     Key(crossterm::event::KeyEvent),
     ScrollUp,
     ScrollDown,
-    Resize(u16, u16),
+    Resize,
     Paste(String),
     #[allow(dead_code)]
     MouseDown {

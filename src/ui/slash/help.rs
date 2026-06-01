@@ -1,11 +1,32 @@
 use crate::ui::slash::{SlashCtx, write_ok, write_result};
 
+pub fn handle_welcome(renderer: &mut crate::ui::renderer::Renderer) {
+    let _ = crate::ui::events::show_welcome(renderer);
+}
+
 pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
     write_ok(ctx.renderer, "commands:");
     write_result(
         ctx.renderer,
-        "  /model [name]          show or switch model",
+        "  /add [path]            add file(s) to context",
     );
+    write_result(
+        ctx.renderer,
+        "  /drop <path>           remove file from context",
+    );
+    write_result(
+        ctx.renderer,
+        "  /drop-all              remove all added files from context",
+    );
+    write_result(
+        ctx.renderer,
+        "  /init [force]          create AGENTS.md for this project",
+    );
+    write_result(
+        ctx.renderer,
+        "  /memory [status|search|read|write|editor|clear]  manage memory",
+    );
+    write_result(ctx.renderer, "  /clear [/new]          clear screen");
     write_result(
         ctx.renderer,
         "  /provider [name]       show or switch provider",
@@ -39,7 +60,7 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
     );
     write_result(
         ctx.renderer,
-        "  /mode <mode>           set mode (standard|restrictive|accept|yolo)",
+        "  /mode <mode>           set mode (standard|restrictive|readonly|guarded|yolo)",
     );
     #[cfg(feature = "mcp")]
     {
@@ -122,8 +143,28 @@ pub fn handle(_parts: &[&str], ctx: &mut SlashCtx<'_>) {
         "  /history               show global chat history",
     );
     write_result(ctx.renderer, "  /quit [/exit]          exit zerostack");
+    write_result(
+        ctx.renderer,
+        "  /welcome               show the quickstart guide",
+    );
+    write_result(ctx.renderer, "  /tutorial              alias for /welcome");
     write_result(ctx.renderer, "  /help                  show this message");
     write_result(ctx.renderer, "");
+    #[cfg(feature = "subagents")]
+    {
+        write_result(
+            ctx.renderer,
+            "  /model-subagent [name] show or switch subagent model",
+        );
+        write_result(
+            ctx.renderer,
+            "  /models-subagent       list quick models for subagent",
+        );
+        write_result(
+            ctx.renderer,
+            "  /models-subagent <n>   switch subagent to a quick model",
+        );
+    }
     write_ok(ctx.renderer, "keys:");
     write_result(ctx.renderer, "  PgUp/PgDn             scroll chat history");
     write_result(ctx.renderer, "  Home/End               jump to top/bottom");

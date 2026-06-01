@@ -40,6 +40,7 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn load_session(id: &str) -> anyhow::Result<Session> {
     let dir = session_dir();
     let path = dir.join(format!("{}.json", id));
@@ -110,6 +111,11 @@ pub fn find_recent_sessions(limit: usize) -> anyhow::Result<Vec<Session>> {
 
 pub fn agents_path() -> PathBuf {
     config_path().join("agent").join("AGENTS.md")
+}
+
+#[cfg(feature = "archmd")]
+pub fn architecture_path() -> PathBuf {
+    config_path().join("agent").join("ARCHITECTURE.md")
 }
 
 fn theme_file_path() -> PathBuf {
