@@ -156,6 +156,7 @@ impl Clone for AnyClient {
             AnyClient::Anthropic(c) => AnyClient::Anthropic(c.clone()),
             AnyClient::Gemini(c) => AnyClient::Gemini(c.clone()),
             AnyClient::Ollama(c) => AnyClient::Ollama(c.clone()),
+            AnyClient::DeepSeek(c) => AnyClient::DeepSeek(c.clone()),
         }
     }
 }
@@ -184,6 +185,7 @@ impl AnyClient {
             AnyClient::Anthropic(_) => "anthropic",
             AnyClient::Gemini(_) => "gemini",
             AnyClient::Ollama(_) => "ollama",
+            AnyClient::DeepSeek(_) => "deepseek",
         }
     }
 
@@ -304,6 +306,9 @@ impl AnyClient {
             // If any arm above does NOT impl ModelListingClient it won't compile —
             // move it down here to the manual fallback.
             AnyClient::OpenAI(OpenAiClient::Completions(_)) => {
+                anyhow::bail!("rig model listing unavailable for this client")
+            }
+            AnyClient::DeepSeek(_) => {
                 anyhow::bail!("rig model listing unavailable for this client")
             }
         };
@@ -476,6 +481,7 @@ impl AnyAgent {
             AnyAgent::Anthropic(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
             AnyAgent::Gemini(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
             AnyAgent::Ollama(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
+            AnyAgent::DeepSeek(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
         }
     }
 
@@ -509,6 +515,7 @@ impl AnyAgent {
             AnyAgent::Anthropic(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
             AnyAgent::Gemini(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
             AnyAgent::Ollama(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            AnyAgent::DeepSeek(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
         }
     }
 }
@@ -922,6 +929,15 @@ pub fn build_btw_agent(
             reasoning_enabled,
         )),
         AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_btw_agent_inner(
+            m,
+            cli,
+            cfg,
+            context,
+            permission,
+            ask_tx,
+            reasoning_enabled,
+        )),
+        AnyModel::DeepSeek(m) => AnyAgent::DeepSeek(builder::build_btw_agent_inner(
             m,
             cli,
             cfg,

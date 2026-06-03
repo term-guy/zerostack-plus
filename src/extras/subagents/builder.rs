@@ -92,5 +92,12 @@ pub(crate) async fn build_explore_agent(
             #[cfg(feature = "archmd")]
             arch_ref,
         )),
+        AnyModel::DeepSeek(m) => AnyAgent::DeepSeek(build_explore_agent_inner(
+            m,
+            max_turns,
+            max_text_file_size,
+            #[cfg(feature = "archmd")]
+            arch_ref,
+        )),
     }
 }
