@@ -4,7 +4,7 @@ use std::time::Duration;
 use compact_str::CompactString;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rig::agent::Agent;
-use rig::client::CompletionClient;
+use rig::client::{CompletionClient, ModelListingClient};
 use rig::completion::{CompletionModel, Message};
 use rig::providers::{anthropic, deepseek, gemini, ollama, openai, openrouter};
 use rig::streaming::StreamingChat;
@@ -64,6 +64,46 @@ pub fn resolve_provider_config(
 /// Re-exported for compatibility with existing code
 pub fn parse_provider(name: &str) -> Option<ProviderKind> {
     ProviderKind::from_name(name)
+}
+
+/// Pick a sensible default model when targeting `provider`. Priority:
+/// a custom gateway's configured `model`, then a quick model targeting this
+/// provider (carrying its pricing), then a built-in fallback. Returns
+/// (model, Option<(input_cost, output_cost)>), or None if `provider` is unknown
+/// and has no configured default. Used both by `/provider` and at startup so a
+/// chosen provider never keeps an id that is invalid on it.
+pub(crate) fn default_model_for_provider(
+    provider: &str,
+    cfg: &Config,
+) -> Option<(String, Option<(f64, f64)>)> {
+    if let Some(c) = cfg.custom_providers_map().get(provider)
+        && let Some(m) = &c.model
+    {
+        return Some((m.to_string(), None));
+    }
+    // Deterministic: prefer the alphabetically-first quick model for this provider
+    // (HashMap iteration order would otherwise be unstable).
+    let qm = crate::config::quick_models_map(cfg);
+    let mut names: Vec<&String> = qm.keys().collect();
+    names.sort();
+    for name in names {
+        let q = &qm[name];
+        if q.provider.as_str() == provider {
+            return Some((
+                q.model.to_string(),
+                Some((q.input_token_cost, q.output_token_cost)),
+            ));
+        }
+    }
+    let m = match provider {
+        "anthropic" => "claude-sonnet-4-6",
+        "openai" => "gpt-5.1",
+        "gemini" | "google" => "gemini-2.5-pro",
+        "openrouter" => "openrouter/auto", // OpenRouter's always-valid auto-router
+        "ollama" => "llama3.1",
+        _ => return None,
+    };
+    Some((m.to_string(), None))
 }
 
 fn resolve_base_url(config: &ProviderConfig) -> Option<String> {
@@ -184,6 +224,138 @@ impl AnyClient {
         let response = summarize_with_model(model, prompt).await?;
         Ok(response)
     }
+}
+
+#[derive(Clone)]
+pub struct ModelEntry {
+    pub id: String,
+    pub display: String,
+    pub context_length: Option<u32>,
+    pub kind: Option<String>, // rig Model.r#type (often None)
+}
+
+impl ModelEntry {
+    fn from_rig(m: &rig::model::listing::Model) -> Self {
+        Self {
+            id: m.id.clone(),
+            display: m.display_name().to_string(),
+            context_length: m.context_length,
+            kind: m.r#type.clone(),
+        }
+    }
+}
+
+/// Chat/completion model suitable as an agent (not embedding/image/audio/etc.)?
+pub fn is_agent_model(m: &ModelEntry) -> bool {
+    if let Some(t) = m.kind.as_deref() {
+        let t = t.to_lowercase();
+        if [
+            "embed",
+            "image",
+            "audio",
+            "video",
+            "moderation",
+            "rerank",
+            "tts",
+            "speech",
+        ]
+        .iter()
+        .any(|k| t.contains(k))
+        {
+            return false;
+        }
+    }
+    let id = m.id.to_lowercase();
+    const DENY: &[&str] = &[
+        "embedding",
+        "embed-",
+        "text-embedding",
+        "gemini-embedding",
+        "whisper",
+        "transcribe",
+        "tts",
+        "-audio",
+        "realtime",
+        "speech",
+        "dall-e",
+        "gpt-image",
+        "image-generation",
+        "imagen",
+        "sora",
+        "veo",
+        "moderation",
+        "rerank",
+        "aqa",
+        "davinci-002",
+        "babbage-002",
+    ];
+    !DENY.iter().any(|d| id.contains(d))
+}
+
+impl AnyClient {
+    /// Built-in providers: rig's ModelListingClient.
+    pub async fn list_models(&self) -> anyhow::Result<Vec<ModelEntry>> {
+        let list = match self {
+            AnyClient::OpenAI(OpenAiClient::Responses(c)) => c.list_models().await?,
+            AnyClient::Anthropic(c) => c.list_models().await?,
+            AnyClient::OpenRouter(c) => c.list_models().await?,
+            AnyClient::Gemini(c) => c.list_models().await?,
+            AnyClient::Ollama(c) => c.list_models().await?,
+            // If any arm above does NOT impl ModelListingClient it won't compile —
+            // move it down here to the manual fallback.
+            AnyClient::OpenAI(OpenAiClient::Completions(_)) => {
+                anyhow::bail!("rig model listing unavailable for this client")
+            }
+        };
+        Ok(list.iter().map(ModelEntry::from_rig).collect())
+    }
+}
+
+/// Custom / OpenAI-compatible gateway: best-effort GET {base}/models.
+pub async fn list_models_manual(
+    provider_name: &str,
+    cli_key: Option<&str>,
+    custom_providers: &std::collections::HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&std::collections::HashMap<String, String>>,
+) -> anyhow::Result<Vec<ModelEntry>> {
+    let config = resolve_provider_config(provider_name, custom_providers)?;
+    let base = config
+        .base_url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no base_url"))?;
+    let key = AuthResolver::new(config.kind)
+        .with_cli_key(cli_key)
+        .with_env_override(config.api_key_env.as_deref())
+        .with_config_keys(config_api_keys)
+        .with_custom_provider_name(Some(provider_name))
+        .resolve()
+        .ok();
+    let custom = custom_providers.get(provider_name);
+    let http = build_http_client(provider_name, config.danger_accept_invalid_certs, custom)?;
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let mut req = http.get(url);
+    if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Vec<Item>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Item {
+        id: String,
+    }
+    let resp: Resp = req.send().await?.error_for_status()?.json().await?;
+    Ok(resp
+        .data
+        .into_iter()
+        .map(|i| ModelEntry {
+            display: i.id.clone(),
+            id: i.id,
+            context_length: None,
+            kind: None,
+        })
+        .collect())
 }
 
 async fn summarize_with_model(model: AnyModel, prompt: String) -> anyhow::Result<String> {
@@ -320,12 +492,31 @@ impl AnyAgent {
             AnyAgent::DeepSeek(a) => runner::spawn_agent(a, prompt, history),
         }
     }
+
+    pub fn spawn_btw(
+        self,
+        prompt: String,
+        history: Vec<Message>,
+        event_tx: mpsc::Sender<crate::event::BtwEvent>,
+        id: u32,
+    ) -> crate::agent::runner::BtwRunner {
+        match self {
+            AnyAgent::OpenRouter(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            AnyAgent::OpenAI(a) => match a {
+                OpenAiAgent::Responses(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+                OpenAiAgent::Completions(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            },
+            AnyAgent::Anthropic(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            AnyAgent::Gemini(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            AnyAgent::Ollama(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+        }
+    }
 }
 
 /// Expands a value that is exactly "${VAR}" to the environment variable's value;
 /// any other format is returned as-is. Only whole-string `${VAR}` is supported
 /// (the common, safe case) rather than arbitrary interpolation.
-fn expand_env(value: &str) -> anyhow::Result<String> {
+pub(crate) fn expand_env(value: &str) -> anyhow::Result<String> {
     if let Some(var) = value.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
         std::env::var(var).map_err(|_| {
             anyhow::anyhow!(
@@ -344,7 +535,7 @@ fn expand_env(value: &str) -> anyhow::Result<String> {
 /// When the provider is not custom (`custom == None`) and TLS is not disabled,
 /// the resulting client is equivalent to `reqwest::Client::default()`, so the
 /// behavior of existing providers is unchanged.
-fn build_http_client(
+pub(crate) fn build_http_client(
     provider_name: &str,
     danger_accept_invalid_certs: bool,
     custom: Option<&CustomProviderConfig>,
@@ -385,7 +576,10 @@ fn build_http_client(
 /// if `api_style` is set explicitly, honor it; otherwise default to Completions
 /// when a base_url is present (i.e. a compatible gateway) and Responses when it
 /// is absent (i.e. real api.openai.com).
-fn resolve_api_style(base_url: Option<&str>, custom: Option<&CustomProviderConfig>) -> ApiStyle {
+pub(crate) fn resolve_api_style(
+    base_url: Option<&str>,
+    custom: Option<&CustomProviderConfig>,
+) -> ApiStyle {
     custom.and_then(|c| c.api_style).unwrap_or({
         if base_url.is_some() {
             ApiStyle::Completions
@@ -667,67 +861,74 @@ pub async fn build_agent(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{ApiStyle, CustomProviderConfig};
-
-    fn cfg(api_style: Option<ApiStyle>) -> CustomProviderConfig {
-        CustomProviderConfig {
-            provider_type: "openai".into(),
-            base_url: "https://gw.example/v1".to_string(),
-            api_key_env: None,
-            danger_accept_invalid_certs: None,
-            api_style,
-            headers: std::collections::HashMap::new(),
-            timeout_secs: None,
-            model: None,
-        }
-    }
-
-    #[test]
-    fn defaults_to_responses_without_base_url() {
-        assert_eq!(resolve_api_style(None, None), ApiStyle::Responses);
-    }
-
-    #[test]
-    fn defaults_to_completions_with_base_url() {
-        assert_eq!(
-            resolve_api_style(Some("https://gw.example/v1"), None),
-            ApiStyle::Completions
-        );
-    }
-
-    #[test]
-    fn explicit_style_overrides_base_url_heuristic() {
-        let c = cfg(Some(ApiStyle::Responses));
-        assert_eq!(
-            resolve_api_style(Some("https://gw.example/v1"), Some(&c)),
-            ApiStyle::Responses
-        );
-    }
-
-    #[test]
-    fn explicit_completions_overrides_no_base_url() {
-        let c = cfg(Some(ApiStyle::Completions));
-        assert_eq!(resolve_api_style(None, Some(&c)), ApiStyle::Completions);
-    }
-
-    #[test]
-    fn expand_env_passthrough() {
-        assert_eq!(expand_env("Bearer abc").unwrap(), "Bearer abc");
-    }
-
-    #[test]
-    fn expand_env_reads_var() {
-        // SAFETY: test-only; set and removed within a single test
-        unsafe { std::env::set_var("ZS_TEST_HDR", "secret-value") };
-        assert_eq!(expand_env("${ZS_TEST_HDR}").unwrap(), "secret-value");
-        unsafe { std::env::remove_var("ZS_TEST_HDR") };
-    }
-
-    #[test]
-    fn expand_env_missing_var_errors() {
-        assert!(expand_env("${ZS_DEFINITELY_NOT_SET_98237}").is_err());
+/// Builds the isolated, tool-less `/btw` agent for the active provider.
+pub fn build_btw_agent(
+    model: AnyModel,
+    cli: &Cli,
+    cfg: &Config,
+    context: &ContextFiles,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    reasoning_enabled: bool,
+) -> AnyAgent {
+    match model {
+        AnyModel::OpenRouter(m) => AnyAgent::OpenRouter(builder::build_btw_agent_inner(
+            m,
+            cli,
+            cfg,
+            context,
+            permission,
+            ask_tx,
+            reasoning_enabled,
+        )),
+        AnyModel::OpenAI(m) => AnyAgent::OpenAI(match m {
+            OpenAiModel::Responses(m) => OpenAiAgent::Responses(builder::build_btw_agent_inner(
+                m,
+                cli,
+                cfg,
+                context,
+                permission,
+                ask_tx,
+                reasoning_enabled,
+            )),
+            OpenAiModel::Completions(m) => {
+                OpenAiAgent::Completions(builder::build_btw_agent_inner(
+                    m,
+                    cli,
+                    cfg,
+                    context,
+                    permission,
+                    ask_tx,
+                    reasoning_enabled,
+                ))
+            }
+        }),
+        AnyModel::Anthropic(m) => AnyAgent::Anthropic(builder::build_btw_agent_inner(
+            m,
+            cli,
+            cfg,
+            context,
+            permission,
+            ask_tx,
+            reasoning_enabled,
+        )),
+        AnyModel::Gemini(m) => AnyAgent::Gemini(builder::build_btw_agent_inner(
+            m,
+            cli,
+            cfg,
+            context,
+            permission,
+            ask_tx,
+            reasoning_enabled,
+        )),
+        AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_btw_agent_inner(
+            m,
+            cli,
+            cfg,
+            context,
+            permission,
+            ask_tx,
+            reasoning_enabled,
+        )),
     }
 }

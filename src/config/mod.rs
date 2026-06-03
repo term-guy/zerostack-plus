@@ -75,7 +75,7 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none", rename = "permission-modes")]
     pub permission_modes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub show_tool_details: Option<bool>,
+    pub show_tool_details: Option<ShowToolDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_prompt: Option<CompactString>,
     #[cfg(feature = "git-worktree")]
@@ -142,7 +142,7 @@ impl Config {
     }
 
     pub fn resolve_keep_recent_tokens(&self) -> u64 {
-        self.keep_recent_tokens.unwrap_or(20_000)
+        self.keep_recent_tokens.unwrap_or(10_000)
     }
 
     pub fn resolve_compact_enabled(&self) -> bool {
@@ -179,5 +179,35 @@ impl Config {
         }
 
         perm_configs
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShowToolDetails {
+    Bool(bool),
+    Lines(usize),
+}
+
+impl Default for ShowToolDetails {
+    fn default() -> Self {
+        ShowToolDetails::Lines(3)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ResolvedShowToolDetails {
+    Off,
+    Limited(usize),
+    Unlimited,
+}
+
+impl ShowToolDetails {
+    pub fn resolve(&self) -> ResolvedShowToolDetails {
+        match self {
+            ShowToolDetails::Bool(false) => ResolvedShowToolDetails::Off,
+            ShowToolDetails::Bool(true) => ResolvedShowToolDetails::Unlimited,
+            ShowToolDetails::Lines(n) => ResolvedShowToolDetails::Limited(*n),
+        }
     }
 }

@@ -108,61 +108,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let _ = docs::ensure_global();
+    let version_changed = docs::ensure_global()?;
+    #[cfg(feature = "acp")]
+    let is_interactive = !cli.acp_enabled && !cli.print && !cli.loop_mode;
+    #[cfg(not(feature = "acp"))]
+    let is_interactive = !cli.print && !cli.loop_mode;
+
+    // Load context first so prompts/themes are available early.
+    // (Version-change / ARCHITECTURE.md prompts are deferred to right before
+    // the TUI to avoid blocking startup on stdin.)
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
-
-    #[cfg(feature = "archmd")]
-    let arch_created = if !cli.resolve_no_context_files(&cfg) {
-        let cwd = std::env::current_dir().ok();
-        if let Some(ref cwd) = cwd {
-            crate::extras::archmd::ask_and_create(cwd).unwrap_or_else(|e| {
-                tracing::warn!("Architecture.md prompt failed: {e}");
-                false
-            })
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    // Reload context after potential ARCHITECTURE.md creation
-    #[cfg(feature = "archmd")]
-    {
-        context.architecture = crate::context::load_architecture();
-    }
-
-    let default_prompt = cfg.default_prompt.as_deref().unwrap_or("code");
-    let default_prompt_mode: Option<&str> = if let Some(content) =
-        context.prompts.get(default_prompt)
-    {
-        let (mode_directive, clean_content) = crate::permission::parse_prompt_mode(content);
-        let mut prompt_text = if mode_directive.is_some() {
-            clean_content.to_string()
-        } else {
-            content.clone()
-        };
-
-        // Append available capabilities based on enabled features
-        #[allow(unused_mut)]
-        let mut caps: Vec<&str> = Vec::new();
-        #[cfg(feature = "memory")]
-            caps.push("- **Memory**: persistent memory across sessions (memory_read, memory_write, memory_search)");
-        #[cfg(feature = "subagents")]
-            caps.push("- **Subagents**: delegate specific multi-step investigations to parallel subagents via the `task` tool");
-
-        if !caps.is_empty() {
-            prompt_text.push_str("\n\n## Available Capabilities\n\n");
-            prompt_text.push_str(&caps.join("\n"));
-            prompt_text.push('\n');
-        }
-
-        context.current_prompt = Some(prompt_text);
-        context.current_prompt_name = Some(default_prompt.to_string());
-        mode_directive
-    } else {
-        None
-    };
 
     let mut provider = cli.resolve_provider(&cfg);
     let mut model = cli.resolve_model(&cfg);
@@ -171,15 +126,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(qm) = cli.resolve_quick_model(&cfg) {
         provider = qm.provider.clone();
         model = qm.model.clone();
-    }
-
-    // Custom provider model override (if no explicit model set)
-    if let Some(custom) = cfg.custom_providers_map().get(provider.as_str())
-        && cli.model.is_none()
-        && cfg.model.is_none()
-        && let Some(ref custom_model) = custom.model
-    {
-        model = custom_model.clone();
     }
 
     let mut session = session::Session::new(&provider, &model, cfg.resolve_context_window());
@@ -246,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "subagents")]
     {
-        let task_max_turns = cfg.task_max_turns.unwrap_or(15);
+        let task_max_turns = cfg.task_max_turns.unwrap_or(20);
         let qm = config::quick_models_map(&cfg);
 
         // Resolve subagent model: subagent_model config > subagent_provider + model > deepseek-v4-flash quick model
@@ -262,7 +208,7 @@ async fn main() -> anyhow::Result<()> {
             }
         } else if let Some(sa_prov) = &cfg.subagent_provider {
             (sa_prov.clone(), model.clone())
-        } else if let Some(dsv4) = qm.get("deepseek-v4-flash") {
+        } else if let Some(dsv4) = qm.get("deepseek-v4-pro") {
             (dsv4.provider.clone(), dsv4.model.clone())
         } else {
             (provider.clone(), model.clone())
@@ -280,7 +226,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(c) => c,
                 Err(e) => {
                     // The default subagent provider can differ from the main one
-                    // (the built-in `deepseek-v4-flash` default uses OpenRouter).
+                    // (the built-in `deepseek-v4-pro` default uses OpenRouter).
                     // If its credentials are missing, don't abort the whole program:
                     // fall back to the main agent's client and model so users on a
                     // single provider (e.g. Anthropic-only) can still start.
@@ -323,6 +269,112 @@ async fn main() -> anyhow::Result<()> {
     tools::set_deny_repeated_reads(cfg.deny_repeated_reads.unwrap_or(true));
     let (permission, ask_tx, ask_rx) = build_permission_checker(&cli, &cfg);
 
+    let completion_model = client.completion_model(model.to_string());
+
+    // ── Interactive prompts (last thing before TUI dispatch) ──
+
+    // Version-change prompts: defer to here so all heavy setup completes first.
+    if version_changed && is_interactive {
+        let prompts_dir = context::prompts::global_dir();
+        let themes_dir = context::themes::global_dir();
+        let auto_prompts = !prompts_dir.exists();
+        let auto_themes = !themes_dir.exists();
+        let mut regenerated = false;
+
+        if auto_prompts {
+            let _ = context::prompts::regen();
+            eprintln!("Prompts regenerated (first launch).");
+            regenerated = true;
+        } else {
+            let mut input = String::new();
+            eprint!("Regenerate prompts? [y/N] ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::io::stdin().read_line(&mut input)?;
+            if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                let _ = context::prompts::regen();
+                eprintln!("Prompts regenerated.");
+                regenerated = true;
+            }
+        }
+
+        if auto_themes {
+            let _ = context::themes::regen();
+            eprintln!("Themes regenerated (first launch).");
+            regenerated = true;
+        } else {
+            let mut input = String::new();
+            eprint!("Regenerate themes? [y/N] ");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            std::io::stdin().read_line(&mut input)?;
+            if matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+                let _ = context::themes::regen();
+                eprintln!("Themes regenerated.");
+                regenerated = true;
+            }
+        }
+
+        if regenerated {
+            // Reload context to pick up freshly-regenerated prompts/themes
+            context = context::load(cli.resolve_no_context_files(&cfg));
+        }
+    }
+
+    // ARCHITECTURE.md prompt: defer to here so all heavy setup completes first.
+    #[cfg(feature = "archmd")]
+    let arch_created = if !cli.resolve_no_context_files(&cfg) {
+        let cwd = std::env::current_dir().ok();
+        if let Some(ref cwd) = cwd {
+            crate::extras::archmd::ask_and_create(cwd).unwrap_or_else(|e| {
+                tracing::warn!("Architecture.md prompt failed: {e}");
+                false
+            })
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Reload context after potential ARCHITECTURE.md creation
+    #[cfg(feature = "archmd")]
+    if arch_created {
+        context.architecture = crate::context::load_architecture();
+    }
+
+    // Default prompt resolution (after prompts may have been regenerated)
+    let default_prompt = cfg.default_prompt.as_deref().unwrap_or("code");
+    let default_prompt_mode: Option<&str> = if let Some(content) =
+        context.prompts.get(default_prompt)
+    {
+        let (mode_directive, clean_content) = crate::permission::parse_prompt_mode(content);
+        let mut prompt_text = if mode_directive.is_some() {
+            clean_content.to_string()
+        } else {
+            content.clone()
+        };
+
+        // Append available capabilities based on enabled features
+        #[allow(unused_mut)]
+        let mut caps: Vec<&str> = Vec::new();
+        #[cfg(feature = "memory")]
+            caps.push("- **Memory**: persistent memory across sessions (memory_read, memory_write, memory_search)");
+        #[cfg(feature = "subagents")]
+            caps.push("- **Subagents**: delegate specific multi-step investigations to parallel subagents via the `task` tool");
+
+        if !caps.is_empty() {
+            prompt_text.push_str("\n\n## Available Capabilities\n\n");
+            prompt_text.push_str(&caps.join("\n"));
+            prompt_text.push('\n');
+        }
+
+        context.current_prompt = Some(prompt_text);
+        context.current_prompt_name = Some(default_prompt.to_string());
+        mode_directive
+    } else {
+        None
+    };
+
+    // Apply mode from prompt %%mode= directive (if any)
     if let Some(perm) = &permission {
         let allowlist: Vec<(String, String)> = session
             .permission_allowlist
@@ -331,7 +383,6 @@ async fn main() -> anyhow::Result<()> {
             .collect();
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
         guard.load_session_allowlist(&allowlist);
-        // Apply mode from prompt %%mode= directive (if any)
         if let Some(mode_str) = default_prompt_mode
             && mode_str != "last_user_mode"
             && let Some(mode) = SecurityMode::from_str(mode_str)
@@ -340,8 +391,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let completion_model = client.completion_model(model.to_string());
-
+    // Build the auto-trigger message for ARCHITECTURE.md creation
     #[cfg(feature = "archmd")]
     let arch_msg: Option<String> = if arch_created {
         Some(

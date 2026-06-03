@@ -200,16 +200,22 @@ impl Cli {
     }
 
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
-        self.model
-            .as_deref()
-            .or(cfg.model.as_deref())
-            .map(CompactString::new)
-            .unwrap_or_else(|| {
-                let qm = config::quick_models_map(cfg);
-                qm.get("deepseek-v4-flash")
-                    .map(|q| q.model.clone())
-                    .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-flash"))
-            })
+        if let Some(m) = self.model.as_deref().or(cfg.model.as_deref()) {
+            return CompactString::new(m);
+        }
+        // No explicit model. If a provider was chosen explicitly, default to a
+        // model valid for it so `--provider anthropic` does not keep the
+        // OpenRouter default id; otherwise keep the historic deepseek default.
+        if (self.provider.is_some() || cfg.provider.is_some())
+            && let Some((model, _)) =
+                crate::provider::default_model_for_provider(&self.resolve_provider(cfg), cfg)
+        {
+            return CompactString::new(model);
+        }
+        let qm = config::quick_models_map(cfg);
+        qm.get("deepseek-v4-pro")
+            .map(|q| q.model.clone())
+            .unwrap_or_else(|| CompactString::new("deepseek/deepseek-v4-pro"))
     }
 
     pub fn resolve_provider(&self, cfg: &config::Config) -> CompactString {
@@ -219,18 +225,18 @@ impl Cli {
             .map(CompactString::new)
             .unwrap_or_else(|| {
                 let qm = config::quick_models_map(cfg);
-                qm.get("deepseek-v4-flash")
+                qm.get("deepseek-v4-pro")
                     .map(|q| q.provider.clone())
                     .unwrap_or_else(|| CompactString::new("openrouter"))
             })
     }
 
     pub fn resolve_max_tokens(&self, cfg: &config::Config) -> u64 {
-        self.max_tokens.or(cfg.max_tokens).unwrap_or(8192)
+        self.max_tokens.or(cfg.max_tokens).unwrap_or(16384)
     }
 
     pub fn resolve_max_agent_turns(&self, cfg: &config::Config) -> usize {
-        self.max_agent_turns.or(cfg.max_agent_turns).unwrap_or(100)
+        self.max_agent_turns.or(cfg.max_agent_turns).unwrap_or(200)
     }
 
     pub fn resolve_no_context_files(&self, cfg: &config::Config) -> bool {

@@ -9,6 +9,7 @@ pub enum AgentEvent {
         args: serde_json::Value,
     },
     ToolResult {
+        name: CompactString,
         output: CompactString,
     },
     SubagentToolCall {
@@ -20,6 +21,24 @@ pub enum AgentEvent {
         response: CompactString,
         input_tokens: u64,
         output_tokens: u64,
+    },
+}
+
+/// Events emitted by an isolated `/btw` side-question run. Kept as a separate
+/// type from [`AgentEvent`] so that a side-question result can never be routed
+/// through `handle_agent_event` (which mutates the session): the type system
+/// enforces that `/btw` leaves no trace in conversation history.
+#[derive(Debug, Clone)]
+pub enum BtwEvent {
+    Done {
+        id: u32,
+        response: CompactString,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    Error {
+        id: u32,
+        message: CompactString,
     },
 }
 

@@ -33,7 +33,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 
 _zerostack-plus_ is one of the smallest and most performant coding agents on the market.
 
-- Lines of code: ~16k LoC
+- Lines of code: ~17k LoC
 - Binary size: 26MB
 - RAM footprint: ~16MB on average, with peaks at ~24MB (vs ~300MB with peaks at ~700MB for opencode or other JS-based coding agents)
 - CPU usage: 0.0% on idle, ~1.5% when using tools (measured on an Intel i5 7th gen, vs ~2% on idle and ~20% when working for opencode)
@@ -186,8 +186,47 @@ This is a list of the most important slash commands:
 - `/loop` — Schedule recurring prompts
 - `/prompt` — List or change the agent's prompt
 - `/mode` — Set the permission system's mode
+- `/queue` — Manage input queued while the agent is busy
+- `/btw` — Ask a quick side question in parallel without interrupting the agent
 
 To see all of the commands, use `/help`.
+
+## Input queue
+
+You can keep typing while the agent is running. Plain text is not sent right
+away and never starts a second concurrent run; it is queued and replayed as the
+next prompt once the current run finishes. Each queued line is shown as
+`queued: <text>`.
+
+Manage the queue with `/queue`, which works even while a run is active:
+
+- `/queue ls` lists the pending inputs (bare `/queue` does the same)
+- `/queue clear` empties the queue
+- `/queue pop` removes the last queued input, to undo a mis-typed line
+
+Selecting `/queue` in the command picker opens a second-level menu with these
+three subcommands, so you do not need to remember them.
+
+Commands (input starting with `/`, `.`, or `!`) are not queued while a run is
+active: wait for it to finish, or press Ctrl-C. Ctrl-C cancels the running agent
+for real, including any child processes it spawned, and clears the queue.
+
+## Side questions (`/btw`)
+
+`/btw <message>` asks a quick "by the way" question in parallel with the main
+agent, without interrupting it. Like `/queue`, it works even while the agent is
+busy. It forks the current context (including a trace of the agent's in-flight
+turn, when one is running) and answers using four read-only tools (`read`,
+`grep`, `find_files`, `list_dir`); it cannot write files or run commands. It then
+prints the reply inline.
+Nothing is written to conversation history, and its token usage is tracked
+separately in the status bar as `btw:…`. Press Ctrl-C to cancel an in-flight
+`/btw` without disturbing the main agent.
+
+You can point a question at a specific file with `@`: pick `/btw` from the
+command menu, then type `@` to open the file picker (for example `/btw` then
+`@src/main.rs` then "how does this work?"), and `/btw` reads the file you
+reference.
 
 ## Session management
 

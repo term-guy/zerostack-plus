@@ -1,12 +1,14 @@
-mod add;
+pub(crate) mod add;
 mod content;
 mod features;
 mod help;
-mod init;
+pub(crate) mod init;
 mod memory;
 mod providers;
 mod session;
 mod settings;
+
+pub(crate) use providers::warm_model_cache;
 
 use smallvec::SmallVec;
 

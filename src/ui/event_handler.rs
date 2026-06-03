@@ -2,8 +2,9 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
+use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
-use crate::config::Config;
+use crate::config::{Config, ResolvedShowToolDetails};
 use crate::context::ContextFiles;
 use crate::event::AgentEvent;
 #[cfg(feature = "mcp")]
@@ -178,23 +179,77 @@ pub async fn handle_agent_event(
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
-        AgentEvent::ToolResult { output } => {
-            let show_details = cfg.show_tool_details.unwrap_or(false);
-            if show_details {
-                let sanitized = sanitize_output(&output);
-                let char_count = sanitized.chars().count();
-                let preview: String = sanitized.chars().take(120).collect();
-                let preview_trimmed = if char_count > 120 {
-                    format!("{}...", preview)
+        AgentEvent::ToolResult { name, output } => {
+            if name == "write_todo_list" {
+                let list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
+                if list.is_empty() {
+                    renderer.write_line("tasks cleared", Color::DarkGrey)?;
                 } else {
-                    preview
-                };
-                let summary = if char_count > 120 {
-                    format!("◈ result ({} chars): {}", char_count, preview_trimmed)
-                } else {
-                    preview_trimmed
-                };
-                renderer.write_line(&summary, Color::DarkGrey)?;
+                    let total = list.len();
+                    let completed = list.iter().filter(|t| t.status == "completed").count();
+                    renderer.write_line(
+                        &format!("tasks  {} done / {} total", completed, total),
+                        C_TOOL,
+                    )?;
+                    for item in list.iter() {
+                        let icon = match item.status.as_str() {
+                            "completed" => "[x]",
+                            "in_progress" => "[>]",
+                            "cancelled" => "[-]",
+                            _ => "[ ]",
+                        };
+                        let status_color = match item.status.as_str() {
+                            "completed" => Color::Green,
+                            "in_progress" => C_TOOL,
+                            "cancelled" => Color::DarkGrey,
+                            _ => Color::DarkGrey,
+                        };
+                        let priority_mark = match item.priority.as_str() {
+                            "high" => "!!",
+                            "medium" => "! ",
+                            _ => "  ",
+                        };
+                        renderer.write_line(
+                            &format!("  {} {} {}", icon, priority_mark, item.content),
+                            status_color,
+                        )?;
+                    }
+                }
+            } else {
+                let show_details = cfg
+                    .show_tool_details
+                    .as_ref()
+                    .map(|s| s.resolve())
+                    .unwrap_or(ResolvedShowToolDetails::Limited(3));
+                match show_details {
+                    ResolvedShowToolDetails::Off => {}
+                    ResolvedShowToolDetails::Limited(max_lines) => {
+                        let sanitized = sanitize_output(&output);
+                        let char_count = sanitized.chars().count();
+                        let lines: Vec<&str> = sanitized.lines().collect();
+                        if lines.len() > max_lines {
+                            let shown = lines[..max_lines].join("\n");
+                            let summary = format!(
+                                "◈ result ({} chars, {} lines, showing {}):\n{}",
+                                char_count,
+                                lines.len(),
+                                max_lines,
+                                shown
+                            );
+                            renderer.write_line(&summary, Color::DarkGrey)?;
+                        } else {
+                            let summary =
+                                format!("◈ result ({} chars):\n{}", char_count, sanitized);
+                            renderer.write_line(&summary, Color::DarkGrey)?;
+                        }
+                    }
+                    ResolvedShowToolDetails::Unlimited => {
+                        let sanitized = sanitize_output(&output);
+                        let char_count = sanitized.chars().count();
+                        let summary = format!("◈ result ({} chars):\n{}", char_count, sanitized);
+                        renderer.write_line(&summary, Color::DarkGrey)?;
+                    }
+                }
             }
         }
         AgentEvent::Done {

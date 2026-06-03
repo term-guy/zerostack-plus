@@ -274,7 +274,6 @@ fn complete_merge_with_force(state: &MergeState, force: bool) -> Result<(), Stri
     let _ = std::env::set_current_dir(&state.info.main_repo_path);
 
     let result = (|| {
-        run_git(["push"])?;
         if force {
             run_git([
                 "worktree",
@@ -443,85 +442,5 @@ fn has_uncommitted_changes() -> bool {
     match output {
         Ok(out) if out.status.success() => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
         _ => false,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_worktree_info_clone() {
-        let info = WorktreeInfo {
-            branch: "feature-x".into(),
-            worktree_path: PathBuf::from("/tmp/wt"),
-            main_repo_path: PathBuf::from("/tmp/repo"),
-        };
-        let cloned = info.clone();
-        assert_eq!(cloned.branch, "feature-x");
-        assert_eq!(cloned.worktree_path, PathBuf::from("/tmp/wt"));
-        assert_eq!(cloned.main_repo_path, PathBuf::from("/tmp/repo"));
-    }
-
-    #[test]
-    fn test_merge_outcome_success() {
-        let outcome = MergeOutcome::Success;
-        assert!(matches!(outcome, MergeOutcome::Success));
-        assert_eq!(outcome, MergeOutcome::Success);
-    }
-
-    #[test]
-    fn test_merge_outcome_conflicts() {
-        let files = vec!["src/main.rs".into(), "Cargo.toml".into()];
-        let outcome = MergeOutcome::Conflicts(files.clone());
-        match outcome {
-            MergeOutcome::Conflicts(ref f) => assert_eq!(f.len(), 2),
-            _ => panic!("expected Conflicts"),
-        }
-    }
-
-    #[test]
-    fn test_merge_outcome_error() {
-        let outcome = MergeOutcome::Error("something went wrong".into());
-        match outcome {
-            MergeOutcome::Error(ref msg) => assert!(msg.contains("wrong")),
-            _ => panic!("expected Error"),
-        }
-    }
-
-    #[test]
-    fn test_repo_name_basic() {
-        let path = PathBuf::from("/home/user/my-project");
-        assert_eq!(repo_name(&path), "my-project");
-    }
-
-    #[test]
-    fn test_repo_name_trailing_slash() {
-        let path = PathBuf::from("/home/user/repo/");
-        assert_eq!(repo_name(&path), "repo");
-    }
-
-    #[test]
-    fn test_repo_name_empty() {
-        let path = PathBuf::from("");
-        assert_eq!(repo_name(&path), "unknown");
-    }
-
-    #[test]
-    fn test_merge_state_clone() {
-        let state = MergeState {
-            info: WorktreeInfo {
-                branch: "feat".into(),
-                worktree_path: PathBuf::from("/tmp/wt"),
-                main_repo_path: PathBuf::from("/tmp/repo"),
-            },
-            original_branch: "main".into(),
-            orig_dir: PathBuf::from("/tmp/wt"),
-            stashed: true,
-        };
-        let cloned = state.clone();
-        assert_eq!(cloned.original_branch, "main");
-        assert!(cloned.stashed);
-        assert_eq!(cloned.orig_dir, PathBuf::from("/tmp/wt"));
     }
 }
