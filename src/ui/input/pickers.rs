@@ -57,17 +57,15 @@ impl InputEditor {
                 handlers::handle_file_key(&mut self.buffer, &mut self.cursor, p, key)
             }
             Some(Picker::Command(p)) => {
-                let (handled, replacement) = handlers::handle_command_key(
-                    &mut self.buffer,
-                    &mut self.cursor,
-                    &self.prompt_names,
-                    &self.theme_names,
-                    &self.quick_model_names,
-                    &self.live_model_names,
-                    &self.provider_names,
-                    p,
-                    key,
-                );
+                let ctx = handlers::CommandPickerCtx {
+                    prompt_names: &self.prompt_names,
+                    theme_names: &self.theme_names,
+                    quick_model_names: &self.quick_model_names,
+                    live_model_names: &self.live_model_names,
+                    provider_names: &self.provider_names,
+                };
+                let (handled, replacement) =
+                    handlers::handle_command_key(&mut self.buffer, &mut self.cursor, &ctx, p, key);
                 if let Some(new) = replacement {
                     self.picker = Some(new);
                 }

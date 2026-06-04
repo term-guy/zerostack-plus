@@ -52,7 +52,7 @@ pub(crate) fn apply_current_prompt_mode(
     let Some(content) = &context.current_prompt.clone() else {
         return;
     };
-    let (mode_directive, clean_content) = permission::parse_prompt_mode(&content);
+    let (mode_directive, clean_content) = permission::parse_prompt_mode(content);
     if mode_directive.is_some() {
         context.current_prompt = Some(clean_content.to_string());
     }
@@ -876,8 +876,8 @@ pub async fn run_interactive(
                                                 content
                                             });
                                             context.current_prompt_name = Some(prompt_name.to_string());
-                                            if let Some(ref mode_str) = mode_directive {
-                                                if let Some(perm) = &permission {
+                                            if let Some(ref mode_str) = mode_directive
+                                                && let Some(perm) = &permission {
                                                     let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
                                                     if mode_str == "last_user_mode" {
                                                         guard.restore_user_mode();
@@ -885,7 +885,6 @@ pub async fn run_interactive(
                                                         guard.set_prompt_mode(mode);
                                                     }
                                                 }
-                                            }
                                         }
                                         text = msg.to_string().into();
                                         is_dot_cmd = false;
@@ -904,8 +903,8 @@ pub async fn run_interactive(
                                                 content
                                             });
                                             context.current_prompt_name = Some(prompt_name.to_string());
-                                            if let Some(ref mode_str) = mode_directive {
-                                                if let Some(perm) = &permission {
+                                            if let Some(ref mode_str) = mode_directive
+                                                && let Some(perm) = &permission {
                                                     let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
                                                     if mode_str == "last_user_mode" {
                                                         guard.restore_user_mode();
@@ -913,7 +912,6 @@ pub async fn run_interactive(
                                                         guard.set_prompt_mode(mode);
                                                     }
                                                 }
-                                            }
                                         }
                                         renderer.write_line(&format!("switched to prompt '{}'", prompt_name), C_AGENT)?;
                                         if !cli.no_session

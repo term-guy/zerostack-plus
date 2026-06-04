@@ -93,10 +93,10 @@ pub(crate) fn has_been_asked_with_path(dir: &Path, asked_path: &Path) -> bool {
     }
     let content = std::fs::read_to_string(asked_path).unwrap_or_default();
     for line in content.lines() {
-        if let Ok(asked_dir) = PathBuf::from(line).canonicalize() {
-            if asked_dir == target {
-                return true;
-            }
+        if let Ok(asked_dir) = PathBuf::from(line).canonicalize()
+            && asked_dir == target
+        {
+            return true;
         }
     }
     false

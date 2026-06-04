@@ -260,7 +260,7 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     if let Some(agents) = context.agents.as_deref()
         && !agents.is_empty()
     {
-        preamble.push_str("\n");
+        preamble.push('\n');
         preamble.push_str(agents);
     }
     #[cfg(feature = "archmd")]

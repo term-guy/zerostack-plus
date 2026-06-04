@@ -97,7 +97,12 @@ pub(crate) fn draw_picker_list(
 
     let top_row = rows.saturating_sub(3).saturating_sub(list_height as u16);
 
-    for i in start_idx..end_idx {
+    for (i, item) in matches
+        .iter()
+        .enumerate()
+        .skip(start_idx)
+        .take(end_idx - start_idx)
+    {
         let render_row = top_row + (i - start_idx) as u16;
         stdout.execute(MoveTo(0, render_row))?;
         write!(
@@ -106,10 +111,7 @@ pub(crate) fn draw_picker_list(
             Clear(crossterm::terminal::ClearType::CurrentLine)
         )?;
 
-        let truncated: String = matches[i]
-            .chars()
-            .take(cols.saturating_sub(3) as usize)
-            .collect();
+        let truncated: String = item.chars().take(cols.saturating_sub(3) as usize).collect();
 
         if i == selected {
             write!(

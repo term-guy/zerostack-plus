@@ -200,15 +200,15 @@ pub fn try_merge(info: &WorktreeInfo, target: &str) -> (MergeState, MergeOutcome
 
     // Helper to clean up on early-stage errors: pop stash, restore dir
     let cleanup_early = |state: &mut MergeState, err: String| -> MergeOutcome {
-        if state.stashed {
-            if let Err(e) = run_git(["stash", "pop"]) {
-                tracing::error!(
-                    branch = %state.info.branch,
-                    error = %e,
-                    "worktree merge: failed to restore stash during early cleanup; \
-                     stashed changes may be lost; try `git stash pop` manually"
-                );
-            }
+        if state.stashed
+            && let Err(e) = run_git(["stash", "pop"])
+        {
+            tracing::error!(
+                branch = %state.info.branch,
+                error = %e,
+                "worktree merge: failed to restore stash during early cleanup; \
+                 stashed changes may be lost; try `git stash pop` manually"
+            );
         }
         let _ = std::env::set_current_dir(&state.orig_dir);
         MergeOutcome::Error(err)
@@ -293,31 +293,31 @@ fn complete_merge_with_force(state: &MergeState, force: bool) -> Result<(), Stri
         Ok::<(), String>(())
     })();
 
-    if result.is_ok() {
-        if state.stashed {
-            if let Err(e) = run_git(["stash", "pop"]) {
-                tracing::error!(
-                    branch = %state.info.branch,
-                    error = %e,
-                    "worktree complete_merge: failed to pop stash; \
-                     changes may be lost; try `git stash pop` manually"
-                );
-                let _ = std::env::set_current_dir(&state.orig_dir);
-                return Err(format!(
-                    "merge succeeded but stash pop failed: {}. \
-                     Your changes are in the stash; run `git stash pop` manually.",
-                    e
-                ));
-            }
-        }
-        let _ = std::env::set_current_dir(&state.orig_dir);
-    } else {
+    if let Err(e) = &result {
         tracing::error!(
             branch = %state.info.branch,
-            error = %result.as_ref().unwrap_err(),
+            error = %e,
             "worktree complete_merge: cleanup failed"
         );
         let _ = std::env::set_current_dir(&current);
+    } else {
+        if state.stashed
+            && let Err(e) = run_git(["stash", "pop"])
+        {
+            tracing::error!(
+                branch = %state.info.branch,
+                error = %e,
+                "worktree complete_merge: failed to pop stash; \
+                 changes may be lost; try `git stash pop` manually"
+            );
+            let _ = std::env::set_current_dir(&state.orig_dir);
+            return Err(format!(
+                "merge succeeded but stash pop failed: {}. \
+                     Your changes are in the stash; run `git stash pop` manually.",
+                e
+            ));
+        }
+        let _ = std::env::set_current_dir(&state.orig_dir);
     }
 
     result
@@ -328,9 +328,7 @@ pub fn cancel_merge(state: &MergeState) -> Result<(), String> {
     let _ = std::env::set_current_dir(&state.info.main_repo_path);
 
     if has_merge_conflict() {
-        if let Err(e) = run_git_quiet_logged(["merge", "--abort"], "cancel_merge: merge --abort") {
-            return Err(e);
-        }
+        run_git_quiet_logged(["merge", "--abort"], "cancel_merge: merge --abort")?
     }
     if !state.original_branch.is_empty() {
         let _ = run_git_quiet_logged(
@@ -338,14 +336,14 @@ pub fn cancel_merge(state: &MergeState) -> Result<(), String> {
             "cancel_merge: checkout original",
         );
     }
-    if state.stashed {
-        if let Err(e) = run_git_quiet_logged(["stash", "pop"], "cancel_merge: stash pop") {
-            tracing::error!(
-                branch = %state.info.branch,
-                error = %e,
-                "cancel_merge: failed to pop stash; try `git stash pop` manually"
-            );
-        }
+    if state.stashed
+        && let Err(e) = run_git_quiet_logged(["stash", "pop"], "cancel_merge: stash pop")
+    {
+        tracing::error!(
+            branch = %state.info.branch,
+            error = %e,
+            "cancel_merge: failed to pop stash; try `git stash pop` manually"
+        );
     }
     let _ = std::env::set_current_dir(&state.orig_dir);
 

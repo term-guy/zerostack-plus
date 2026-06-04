@@ -108,14 +108,18 @@ pub fn handle_file_key(
     }
 }
 
+pub struct CommandPickerCtx<'a> {
+    pub prompt_names: &'a [String],
+    pub theme_names: &'a [String],
+    pub quick_model_names: &'a [String],
+    pub live_model_names: &'a [String],
+    pub provider_names: &'a [String],
+}
+
 pub fn handle_command_key(
     buffer: &mut CompactString,
     cursor: &mut usize,
-    prompt_names: &[String],
-    theme_names: &[String],
-    quick_model_names: &[String],
-    live_model_names: &[String],
-    provider_names: &[String],
+    ctx: &CommandPickerCtx,
     picker: &mut ListPicker,
     key: KeyEvent,
 ) -> (bool, Option<Picker>) {
@@ -224,33 +228,36 @@ pub fn handle_command_key(
                 *buffer = format!("{}{}", before, insertion).into();
                 *cursor = before.len() + selected.len() + 1;
 
-                if selected == "/prompt" && !prompt_names.is_empty() {
+                if selected == "/prompt" && !ctx.prompt_names.is_empty() {
                     picker.deactivate();
                     let mut pp = ListPicker::new();
-                    pp.set_items(prompt_names.to_vec());
+                    pp.set_items(ctx.prompt_names.to_vec());
                     pp.activate();
                     return (true, Some(Picker::Prefixed(pp, "/prompt ")));
                 }
                 if selected == "/models"
-                    && !(quick_model_names.is_empty() && live_model_names.is_empty())
+                    && !(ctx.quick_model_names.is_empty() && ctx.live_model_names.is_empty())
                 {
                     picker.deactivate();
                     let mut mp = ModelsPicker::new();
-                    mp.set_groups(quick_model_names.to_vec(), live_model_names.to_vec());
+                    mp.set_groups(
+                        ctx.quick_model_names.to_vec(),
+                        ctx.live_model_names.to_vec(),
+                    );
                     mp.activate();
                     return (true, Some(Picker::Models(mp)));
                 }
-                if selected == "/theme" && !theme_names.is_empty() {
+                if selected == "/theme" && !ctx.theme_names.is_empty() {
                     picker.deactivate();
                     let mut tp = ListPicker::new();
-                    tp.set_items(theme_names.to_vec());
+                    tp.set_items(ctx.theme_names.to_vec());
                     tp.activate();
                     return (true, Some(Picker::Prefixed(tp, "/theme ")));
                 }
-                if selected == "/provider" && !provider_names.is_empty() {
+                if selected == "/provider" && !ctx.provider_names.is_empty() {
                     picker.deactivate();
                     let mut pp = ListPicker::new();
-                    pp.set_items(provider_names.to_vec());
+                    pp.set_items(ctx.provider_names.to_vec());
                     pp.activate();
                     return (true, Some(Picker::Prefixed(pp, "/provider ")));
                 }
