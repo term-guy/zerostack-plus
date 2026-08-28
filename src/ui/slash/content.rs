@@ -1,7 +1,7 @@
 use crate::context;
-use crate::permission::{self, SecurityMode};
 use crate::session::storage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
+use crate::ui::{PromptModeOutcome, apply_prompt_mode};
 
 pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     match parts[0] {
@@ -40,25 +40,32 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
         } else {
             ctx.context.current_prompt = None;
             ctx.context.current_prompt_name = None;
-            ctx.rebuild_agent().await;
+            ctx.session.prompt = None;
+            // Revert to the config default model
+            let default_model = ctx.cli.resolve_model(ctx.cfg);
+            let default_provider = ctx.cli.resolve_provider(ctx.cfg);
+            let provider_changed = default_provider != ctx.session.provider;
+            ctx.session.model = default_model;
+            if provider_changed {
+                if let Err(e) = ctx
+                    .rebuild_agent_with_client(&default_provider, *ctx.reasoning_enabled)
+                    .await
+                {
+                    write_error(ctx.renderer, format!("failed to revert provider: {}", e));
+                } else {
+                    ctx.session.provider = default_provider;
+                }
+            } else {
+                ctx.rebuild_agent().await;
+            }
             write_ok(ctx.renderer, "prompt cleared (back to default)");
         }
     } else {
         let name = parts[1].trim();
-        if let Some(content) = ctx.context.prompts.get(name) {
-            let (mode_directive, clean_content) = permission::parse_prompt_mode(content);
-            ctx.context.current_prompt = Some(if mode_directive.is_some() {
-                clean_content.to_string()
-            } else {
-                content.clone()
-            });
-            ctx.context.current_prompt_name = Some(name.to_string());
-            if let Some(mode_str) = mode_directive {
-                if mode_str == "last_user_mode" {
+        if ctx.context.prompts.contains_key(name) {
+            match apply_prompt_mode(name, ctx.context, ctx.session, ctx.permission) {
+                PromptModeOutcome::RestoredUserMode => {
                     if let Some(perm) = ctx.permission {
-                        perm.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .restore_user_mode();
                         let current = perm
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -66,19 +73,19 @@ async fn handle_prompt(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
                             .to_string();
                         write_ok(ctx.renderer, format!("restored user mode: {}", current));
                     }
-                } else if let Some(mode) = SecurityMode::from_str(mode_str)
-                    && let Some(perm) = ctx.permission
-                {
-                    perm.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .set_prompt_mode(mode);
+                }
+                PromptModeOutcome::Applied(mode) => {
                     write_ok(
                         ctx.renderer,
                         format!("security mode: {} (from prompt)", mode),
                     );
                 }
+                PromptModeOutcome::None => {}
             }
-            ctx.rebuild_agent().await;
+            let model_switched = ctx.switch_to_prompt_model(name).await;
+            if !model_switched {
+                ctx.rebuild_agent().await;
+            }
             write_ok(ctx.renderer, format!("active prompt: {}", name));
         } else {
             write_error(ctx.renderer, format!("unknown prompt: '{}'", name));
@@ -119,7 +126,12 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             write_ok(ctx.renderer, "no active theme to clear");
         } else {
             ctx.context.current_theme_name = None;
-            let _ = storage::save_theme_name(None);
+            if let Err(e) = storage::save_theme_name(None) {
+                write_error(
+                    ctx.renderer,
+                    format!("warning: theme choice not saved: {}", e),
+                );
+            }
             if let Some(colors) = &ctx.cfg.colors {
                 let chat_bg = colors
                     .chat_background
@@ -142,7 +154,12 @@ async fn handle_theme(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         let name = parts[1].trim();
         if let Some(content) = ctx.context.themes.get(name) {
             ctx.context.current_theme_name = Some(name.to_string());
-            let _ = storage::save_theme_name(Some(name));
+            if let Err(e) = storage::save_theme_name(Some(name)) {
+                write_error(
+                    ctx.renderer,
+                    format!("warning: theme choice not saved: {}", e),
+                );
+            }
             crate::context::themes::apply(content, ctx.renderer);
             write_ok(ctx.renderer, format!("active theme: {}", name));
         } else {

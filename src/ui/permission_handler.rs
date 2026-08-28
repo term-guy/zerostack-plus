@@ -1,28 +1,24 @@
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
-use crate::cli::Cli;
 use crate::event::UserEvent;
-use crate::session::Session;
 use crate::ui::renderer::Renderer;
+use crate::ui::state::{AgentRunState, UiContext};
 use crate::ui::utils::suggest_pattern;
 
-use super::C_PERM;
+use super::{C_ERROR, C_PERM};
 
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_permission_request(
     ask_req: crate::permission::ask::AskRequest,
     renderer: &mut Renderer,
-    session: &mut Session,
-    cli: &Cli,
+    ui: &mut UiContext<'_>,
+    run: &mut AgentRunState,
     user_rx: &mut mpsc::Receiver<UserEvent>,
-    agent_line_started: &mut bool,
-    was_reasoning: &mut bool,
 ) -> anyhow::Result<()> {
-    *was_reasoning = false;
-    if *agent_line_started {
+    run.was_reasoning = false;
+    if run.agent_line_started {
         renderer.write_line("", Color::White)?;
-        *agent_line_started = false;
+        run.agent_line_started = false;
     }
 
     renderer.write_line(
@@ -33,6 +29,13 @@ pub async fn handle_permission_request(
         "  (y) allow once  (a) allow always  (n) deny  (ESC) abort",
         C_PERM,
     )?;
+
+    renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
+        tool: format!("[permission] {}: {}", ask_req.tool, ask_req.input).into(),
+        options: "  (y) allow once  (a) allow always  (n) deny  (ESC) abort".into(),
+    });
+    renderer.render_viewport()?;
+    renderer.draw_bottom("", 0, &[], false)?;
 
     let decision = loop {
         tokio::select! {
@@ -56,6 +59,8 @@ pub async fn handle_permission_request(
         }
     };
 
+    renderer.permission_prompt = None;
+
     let allow_pattern = match &decision {
         crate::permission::ask::UserDecision::AllowAlways(p) => Some(p.clone()),
         _ => None,
@@ -67,14 +72,16 @@ pub async fn handle_permission_request(
             &format!("  allowed {} {} (saved to session)", ask_req.tool, pattern),
             Color::Green,
         )?;
-        session
+        ui.session
             .permission_allowlist
             .push(crate::session::PermissionAllowEntry {
                 tool: ask_req.tool.clone(),
                 pattern: pattern.into(),
             });
-        if !cli.no_session {
-            let _ = crate::session::storage::save_session(session);
+        if !ui.cli.no_session
+            && let Err(e) = crate::session::storage::save_session(ui.session)
+        {
+            renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
         }
     }
 

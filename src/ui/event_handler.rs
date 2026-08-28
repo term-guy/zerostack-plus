@@ -1,186 +1,151 @@
 use compact_str::CompactString;
 use crossterm::style::Color;
-use tokio::sync::mpsc;
 
 use crate::agent::tools::todo::TODO_LIST;
 use crate::cli::Cli;
-use crate::config::{Config, ResolvedShowToolDetails};
-use crate::context::ContextFiles;
+use crate::config::ResolvedShowToolDetails;
 use crate::event::AgentEvent;
-#[cfg(feature = "mcp")]
-use crate::extras::mcp::McpClientManager;
-use crate::permission::ask::AskSender;
-use crate::permission::checker::PermCheck;
-use crate::provider::{AnyAgent, AnyClient};
-use crate::sandbox::Sandbox;
+use crate::provider::AnyAgent;
+use crate::session::storage::save_session;
 use crate::session::{MessageRole, Session};
 use crate::ui::events::sanitize_output;
+use crate::ui::feed::BlockStyle;
 use crate::ui::renderer::Renderer;
 use crate::ui::slash::handle_compress;
+use crate::ui::state::{AgentRunState, ChainState, SlashState, TurnUsage, UiContext};
 
-use super::{C_AGENT, C_ERROR, C_TOOL, apply_current_prompt_mode};
+#[cfg(any(feature = "git-worktree", feature = "loop"))]
+use super::C_AGENT;
+#[cfg(feature = "git-worktree")]
+use super::apply_current_prompt_mode;
+use super::{C_ERROR, C_TOOL};
 
-#[cfg(feature = "mcp")]
-#[allow(clippy::too_many_arguments)]
+/// Build the main agent on first use, lazily connecting MCP as well. Callers
+/// only reach the build when `agent` is `None`, so MCP connects at most once.
 pub async fn ensure_agent(
     agent: &mut Option<AnyAgent>,
-    client: &AnyClient,
-    session: &Session,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    sandbox: &Sandbox,
-    reasoning_enabled: bool,
-    mcp_manager: Option<&McpClientManager>,
-) {
-    if agent.is_some() {
-        return;
-    }
-    let model = client.completion_model(session.model.to_string());
-    *agent = Some(
-        crate::provider::build_agent(
-            model,
-            cli,
-            cfg,
-            context,
-            permission.clone(),
-            ask_tx.clone(),
-            sandbox.clone(),
-            reasoning_enabled,
-            mcp_manager,
-        )
-        .await,
-    );
-}
-
-#[cfg(not(feature = "mcp"))]
-#[allow(clippy::too_many_arguments)]
-pub async fn ensure_agent(
-    agent: &mut Option<AnyAgent>,
-    client: &AnyClient,
-    session: &Session,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    sandbox: &Sandbox,
+    ui: &mut UiContext<'_>,
     reasoning_enabled: bool,
 ) {
     if agent.is_some() {
         return;
     }
-    let model = client.completion_model(session.model.to_string());
+    #[cfg(feature = "mcp")]
+    crate::ui::ensure_mcp_manager(&mut ui.mcp_manager, ui.cfg).await;
     *agent = Some(
-        crate::provider::build_agent(
-            model,
-            cli,
-            cfg,
-            context,
-            permission.clone(),
-            ask_tx.clone(),
-            sandbox.clone(),
-            reasoning_enabled,
-        )
-        .await,
+        ui.agent_build_ctx()
+            .rebuild_agent(&ui.session.model, reasoning_enabled)
+            .await,
     );
+    // Keep the pre-calibration context estimate in sync with the preamble we
+    // just built (system prompt + tools + context files).
+    ui.session.overhead_tokens =
+        crate::agent::builder::estimate_overhead(ui.context, reasoning_enabled);
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_agent_event(
     event: AgentEvent,
     renderer: &mut Renderer,
-    session: &mut Session,
-    cfg: &Config,
-    cli: &Cli,
-    context: &mut ContextFiles,
-    is_running: &mut bool,
-    agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
-    agent_line_started: &mut bool,
-    response_buf: &mut String,
-    response_start_line: &mut Option<usize>,
-    was_reasoning: &mut bool,
-    show_reasoning: bool,
-    agent: &mut Option<AnyAgent>,
-    client: &mut AnyClient,
-    loop_label: &mut Option<String>,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    sandbox: &Sandbox,
-    #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
-    #[cfg(feature = "git-worktree")] wt_return_path: &mut Option<String>,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&crate::extras::mcp::McpClientManager>,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    slash: &SlashState,
+    chain: &mut ChainState,
 ) -> anyhow::Result<()> {
     match event {
         AgentEvent::Reasoning(text) => {
-            if !show_reasoning {
+            if !slash.show_reasoning {
                 return Ok(());
             }
-            if !*agent_line_started {
+            if !run.agent_line_started {
                 renderer.write("< ", Color::DarkMagenta)?;
-                *agent_line_started = true;
+                run.agent_line_started = true;
             }
             let safe = sanitize_output(&text);
             renderer.write(&safe, Color::DarkMagenta)?;
-            *was_reasoning = true;
+            run.was_reasoning = true;
         }
         AgentEvent::Token(text) => {
-            if *was_reasoning {
+            if run.was_reasoning {
                 renderer.write_line("", Color::White)?;
-                *agent_line_started = false;
-                *was_reasoning = false;
-                response_buf.clear();
-                *response_start_line = None;
+                run.agent_line_started = false;
+                run.was_reasoning = false;
+                run.response_buf.clear();
+                run.response_start_block = None;
             }
             let safe = sanitize_output(&text);
-            response_buf.push_str(&safe);
+            run.response_buf.push_str(&safe);
 
-            if response_buf.is_empty() {
+            if run.response_buf.is_empty() {
                 return Ok(());
             }
 
-            let max_width = renderer.line_width();
-            let mut styled = crate::ui::markdown::markdown_to_styled(response_buf, max_width);
+            if run.response_start_block.is_none() {
+                renderer.feed_mut().push_streaming_block(BlockStyle::Agent);
+                run.response_start_block = Some(renderer.feed().block_count() - 1);
+            }
+            // Append the token to the running block: layout renders the
+            // unfinished tail line as plain text and parses markdown only for
+            // completed lines, instead of re-parsing the whole response.
+            renderer.feed_mut().append_to_last(&safe);
 
-            if !styled.is_empty() {
-                styled[0].text = CompactString::from(format!("< {}", styled[0].text));
+            // Throttle repaints: redraw when a line completed (markdown
+            // structure changes at line boundaries) or while the buffer is
+            // small. The final full parse happens in handle_agent_done.
+            if run.response_buf.len() >= 200 && !run.response_buf.ends_with('\n') {
+                return Ok(());
             }
 
-            if let Some(start) = *response_start_line {
-                renderer.replace_from(start, styled);
-            } else {
-                let start = renderer.buffer_len();
-                *response_start_line = Some(start);
-                renderer.replace_from(start, styled);
-            }
             renderer.render_viewport()?;
-            *agent_line_started = true;
+            run.agent_line_started = true;
         }
-        AgentEvent::ToolCall { name, args } => {
-            *was_reasoning = false;
-            if *agent_line_started {
+        AgentEvent::ToolCall {
+            call_id: event_id,
+            name,
+            args,
+        } => {
+            run.was_reasoning = false;
+            if run.agent_line_started {
                 renderer.write_line("", Color::White)?;
-                *agent_line_started = false;
+                run.agent_line_started = false;
             }
-            response_buf.clear();
-            *response_start_line = None;
+            run.response_buf.clear();
+            run.response_start_block = None;
+            let call_id = ui.session.add_tool_call(&name, &args);
+            run.push_pending_tool_call(event_id, call_id);
+            save_session_if_enabled(ui.session, ui.cli, renderer)?;
             let line = format!(
                 "◈ {}",
                 crate::ui::utils::format_tool_call_summary(&name, &args)
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
+        #[cfg(any(feature = "subagents", feature = "acp"))]
         AgentEvent::SubagentToolCall { name, args } => {
+            // Subagent events are sent from the task the `task` tool spawned,
+            // but they reach this handler through the same mpsc channel as
+            // the main agent's own events, and the subagent finishes before
+            // the `task` tool returns — so they arrive between that call's
+            // `ToolCall` and `ToolResult`, while its id is still pending here.
+            // (Best-effort under a parallel batch; see
+            // `AgentRunState::newest_pending_tool_call`.)
+            ui.session
+                .add_subagent_tool_call(run.newest_pending_tool_call(), &name, &args);
+            save_session_if_enabled(ui.session, ui.cli, renderer)?;
             let line = format!(
                 "⌥ {}",
                 crate::ui::utils::format_tool_call_summary(&name, &args)
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
-        AgentEvent::ToolResult { name, output } => {
-            if name == "write_todo_list" {
+        AgentEvent::ToolResult {
+            call_id: event_id,
+            name,
+            output,
+        } => {
+            let call_id = resolve_tool_result_call_id(run, ui.session, &event_id, &name);
+            ui.session.add_tool_result(call_id, &name, &output);
+            save_session_if_enabled(ui.session, ui.cli, renderer)?;
+            if name == "todo_write" {
                 let list = TODO_LIST.lock().unwrap_or_else(|e| e.into_inner());
                 if list.is_empty() {
                     renderer.write_line("tasks cleared", Color::DarkGrey)?;
@@ -216,7 +181,8 @@ pub async fn handle_agent_event(
                     }
                 }
             } else {
-                let show_details = cfg
+                let show_details = ui
+                    .cfg
                     .show_tool_details
                     .as_ref()
                     .map(|s| s.resolve())
@@ -256,197 +222,343 @@ pub async fn handle_agent_event(
             response,
             input_tokens,
             output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
         } => {
             handle_agent_done(
                 response,
-                input_tokens,
-                output_tokens,
+                TurnUsage {
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                },
                 renderer,
-                session,
-                cfg,
-                cli,
-                context,
-                is_running,
-                agent_rx,
-                agent_line_started,
-                response_buf,
-                response_start_line,
-                was_reasoning,
-                agent,
-                client,
-                loop_label,
-                permission,
-                ask_tx,
-                sandbox,
-                #[cfg(feature = "loop")]
-                loop_state,
-                #[cfg(feature = "git-worktree")]
-                wt_return_path,
-                #[cfg(feature = "mcp")]
-                mcp_manager,
+                run,
+                ui,
+                chain,
             )
             .await?;
         }
+        AgentEvent::CompletionCall {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+        } => {
+            // Real provider-reported usage for the call that just finished.
+            // The local len()/4 heuristic in session.total_estimated_tokens
+            // undercounts code-heavy turns; trust the real number as a floor
+            // so the status bar's x/y/% reflects what the provider actually saw.
+            // Use the cache-inclusive prompt size so Anthropic cache hits (which
+            // report input_tokens excluding cached tokens) don't deflate it.
+            let real = Session::real_input_tokens(
+                ui.cfg.is_anthropic_native(&ui.session.provider),
+                input_tokens,
+                cached_input_tokens,
+                cache_creation_input_tokens,
+            )
+            .saturating_add(output_tokens);
+            if real > ui.session.total_estimated_tokens {
+                ui.session.total_estimated_tokens = real;
+            }
+            // Accumulate cost for intermediate calls (tool-use turns). The Done
+            // event only carries the final call's usage, so without this every
+            // tool-call round-trip would go uncosted.
+            ui.session.total_input_tokens =
+                ui.session.total_input_tokens.saturating_add(input_tokens);
+            ui.session.total_output_tokens =
+                ui.session.total_output_tokens.saturating_add(output_tokens);
+            ui.session.total_cost += crate::pricing::estimate_cost(
+                crate::pricing::billable_input_tokens(
+                    ui.cfg.is_anthropic_native(&ui.session.provider),
+                    input_tokens,
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                ),
+                output_tokens,
+                ui.session.input_token_cost,
+                ui.session.output_token_cost,
+            );
+        }
+        AgentEvent::Retrying { attempt, max } => {
+            run.was_reasoning = false;
+            if run.agent_line_started {
+                renderer.write_line("", Color::White)?;
+                run.agent_line_started = false;
+            }
+            run.response_buf.clear();
+            run.response_start_block = None;
+            renderer.write_line(&format!("retrying... ({}/{})", attempt, max), Color::Yellow)?;
+        }
         AgentEvent::Error(e) => {
-            *was_reasoning = false;
+            run.was_reasoning = false;
             let safe = sanitize_output(&e);
             renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
-            *is_running = false;
-            *agent_rx = None;
-            *agent_line_started = false;
-            response_buf.clear();
-            *response_start_line = None;
+            run.is_running = false;
+            if let Some(ss) = ui.status_signals.as_ref() {
+                ss.send_stop();
+            }
+            run.agent_rx = None;
+            run.agent_line_started = false;
+            run.response_buf.clear();
+            run.response_start_block = None;
+            // A mid-stream error strands whatever was in flight.
+            run.clear_pending_tool_calls();
+            save_session_if_enabled(ui.session, ui.cli, renderer)?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Session call id a `ToolResult` event's output belongs to.
+///
+/// Normally the matching `ToolCall` event left a pending entry. rig also has a
+/// path that streams a result for a call that never produced a `ToolCall`
+/// stream item (an invalid tool call the hook stack skips, abandoning the
+/// turn), so an unmatched result is possible. Session call id 0 is a real call
+/// (`Session::next_tool_call_id` starts there), so such a result must not be
+/// linked to it — that would rewrite the first call's recorded evidence.
+/// Instead a call is synthesized for it, with no arguments because none were
+/// ever streamed, keeping the recorded pair self-consistent.
+pub(crate) fn resolve_tool_result_call_id(
+    run: &mut AgentRunState,
+    session: &mut Session,
+    id: &str,
+    name: &str,
+) -> u64 {
+    if let Some(call_id) = run.take_pending_tool_call(id) {
+        return call_id;
+    }
+    tracing::warn!(
+        "ToolResult for {name} arrived with no matching pending ToolCall (id={escaped}); \
+         recording it against a synthesized orphan call",
+        escaped = id.escape_debug(),
+    );
+    session.add_tool_call(name, &serde_json::Value::Null)
+}
+
+fn save_session_if_enabled(
+    session: &Session,
+    cli: &Cli,
+    renderer: &mut Renderer,
+) -> anyhow::Result<()> {
+    if !cli.no_session
+        && let Err(e) = save_session(session)
+    {
+        renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
+    }
+    Ok(())
+}
+
 async fn handle_agent_done(
     response: CompactString,
-    input_tokens: u64,
-    output_tokens: u64,
+    usage: TurnUsage,
     renderer: &mut Renderer,
-    session: &mut Session,
-    cfg: &Config,
-    cli: &Cli,
-    context: &mut ContextFiles,
-    is_running: &mut bool,
-    agent_rx: &mut Option<mpsc::Receiver<AgentEvent>>,
-    agent_line_started: &mut bool,
-    response_buf: &mut String,
-    response_start_line: &mut Option<usize>,
-    was_reasoning: &mut bool,
-    agent: &mut Option<AnyAgent>,
-    client: &mut AnyClient,
-    loop_label: &mut Option<String>,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    sandbox: &Sandbox,
-    #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
-    #[cfg(feature = "git-worktree")] wt_return_path: &mut Option<String>,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&crate::extras::mcp::McpClientManager>,
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+    chain: &mut ChainState,
 ) -> anyhow::Result<()> {
-    *was_reasoning = false;
+    // `chain` is only read by the /loop-respawn and worktree-return paths.
+    #[cfg(not(any(feature = "loop", feature = "git-worktree")))]
+    let _ = &chain;
+    run.was_reasoning = false;
 
-    if !response_buf.is_empty() {
-        let max_width = renderer.line_width();
-        let mut styled = crate::ui::markdown::markdown_to_styled(response_buf, max_width);
-        if !styled.is_empty() {
-            styled[0].text = CompactString::from(format!("< {}", styled[0].text));
+    if !run.response_buf.is_empty() {
+        if let Some(start) = run.response_start_block {
+            // Drop anything interleaved after the streaming block, then
+            // finalize it: the full response (including the last line) is
+            // parsed as markdown once, here.
+            renderer.feed_mut().truncate_blocks(start + 1);
+            renderer.feed_mut().finalize_last();
+        } else {
+            renderer
+                .feed_mut()
+                .push_block(BlockStyle::Agent, run.response_buf.as_str());
         }
-        if let Some(start) = *response_start_line {
-            renderer.replace_from(start, styled);
-            renderer.render_viewport()?;
-        }
-    } else if !*agent_line_started {
-        renderer.write("< ", C_AGENT)?;
+        renderer.render_viewport()?;
+    } else if !run.agent_line_started {
+        renderer.feed_mut().push_line(BlockStyle::Agent, "< ");
     }
 
     renderer.write_line("", Color::White)?;
     renderer.write_line("", Color::White)?;
-    session.add_message(MessageRole::Assistant, &response);
-    session.total_input_tokens = session.total_input_tokens.saturating_add(input_tokens);
-    session.total_output_tokens = session.total_output_tokens.saturating_add(output_tokens);
-    session.total_cost += crate::pricing::estimate_cost(
-        input_tokens,
-        output_tokens,
-        session.input_token_cost,
-        session.output_token_cost,
+    ui.session.add_message(MessageRole::Assistant, &response);
+    // `total_input_tokens`/`total_output_tokens` keep the raw provider-reported
+    // counts (that's what those fields mean), but cost prices the *billable*
+    // input — for Anthropic that folds in cache reads/writes, which the raw
+    // `input_tokens` excludes yet are still billed (see `billable_input_tokens`).
+    ui.session.total_input_tokens = ui
+        .session
+        .total_input_tokens
+        .saturating_add(usage.input_tokens);
+    ui.session.total_output_tokens = ui
+        .session
+        .total_output_tokens
+        .saturating_add(usage.output_tokens);
+    ui.session.total_cost += crate::pricing::estimate_cost(
+        crate::pricing::billable_input_tokens(
+            ui.cfg.is_anthropic_native(&ui.session.provider),
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+        ),
+        usage.output_tokens,
+        ui.session.input_token_cost,
+        ui.session.output_token_cost,
     );
-    *agent_line_started = false;
-    response_buf.clear();
-    *response_start_line = None;
+    // Anchor context-size accounting to the provider's real usage. Context
+    // measurement needs the full prompt size, so use the cache-inclusive count
+    // (Anthropic reports input_tokens excluding cached/cache-creation tokens,
+    // which would otherwise collapse the context meter to ~0 on cache hits).
+    // Must come after add_message so the anchor includes the just-appended response.
+    let context_input_tokens = Session::real_input_tokens(
+        ui.cfg.is_anthropic_native(&ui.session.provider),
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_creation_input_tokens,
+    );
+    ui.session
+        .set_calibration(context_input_tokens, usage.output_tokens);
+    run.agent_line_started = false;
+    run.response_buf.clear();
+    run.response_start_block = None;
 
     #[cfg(feature = "loop")]
-    let loop_running = loop_state.as_ref().is_some_and(|ls| ls.active);
+    let loop_running = chain.loop_state.as_ref().is_some_and(|ls| ls.active);
     #[cfg(not(feature = "loop"))]
     let loop_running = false;
 
+    let qm = crate::config::quick_models_map(ui.cfg);
+
     #[cfg(feature = "memory")]
     let reserve = crate::extras::memory::effective_reserve(
-        cfg.resolve_reserve_tokens(),
-        context.memory.as_deref(),
+        ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm),
+        ui.context.memory.as_deref(),
     );
     #[cfg(not(feature = "memory"))]
-    let reserve = cfg.resolve_reserve_tokens();
+    let reserve = ui.cfg.resolve_reserve_tokens(&ui.session.model, &qm);
 
     if !loop_running
-        && cfg.resolve_compact_enabled()
-        && session.needs_compaction(reserve)
-        && !cli.no_session
+        && ui.cfg.resolve_compact_enabled()
+        && ui.session.needs_compaction(reserve)
+        && !ui.cli.no_session
     {
-        renderer.write_line("auto-compacting...", Color::DarkGrey)?;
-        let compress_result = handle_compress(
-            None,
-            agent,
-            client,
-            renderer,
-            session,
-            cli,
-            cfg,
-            context,
-            true,
-            permission,
-            ask_tx,
-            sandbox,
-            #[cfg(feature = "mcp")]
-            mcp_manager,
-        )
-        .await;
+        let compress_result = handle_compress(None, true, &mut run.agent, renderer, ui, true).await;
         if let Err(e) = compress_result {
             renderer.write_line(&format!("auto-compact error: {}", e), C_ERROR)?;
         }
     }
 
-    if !cli.no_session
-        && let Err(e) = crate::session::storage::save_session(session)
+    if !ui.cli.no_session
+        && let Err(e) = save_session(ui.session)
     {
         renderer.write_line(&format!("warning: failed to save session: {}", e), C_ERROR)?;
     }
-    *is_running = false;
-    *agent_rx = None;
+    run.is_running = false;
+    if let Some(ss) = ui.status_signals.as_ref() {
+        ss.send_stop();
+    }
+    run.agent_rx = None;
+    // A clean turn has consumed every entry already; this covers a turn that
+    // ended with calls still open, and must precede the /loop respawn below so
+    // the next iteration starts empty.
+    run.clear_pending_tool_calls();
 
     #[cfg(feature = "loop")]
-    if let Some(ls) = loop_state
+    if let Some(ls) = chain.loop_state.as_mut()
         && ls.active
     {
+        let summary: String = response
+            .chars()
+            .take(crate::extras::r#loop::SUMMARY_TRUNCATION_CHARS)
+            .collect();
+        ls.last_summary = Some(summary.clone());
+
+        let validation_output = if let Some(cmd) = &ls.run_cmd {
+            let shell = if cfg!(windows) { "powershell" } else { "sh" };
+            let shell_arg = if cfg!(windows) { "-Command" } else { "-c" };
+            match tokio::process::Command::new(shell)
+                .arg(shell_arg)
+                .arg(cmd)
+                .output()
+                .await
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                    let combined = if stderr.is_empty() {
+                        stdout
+                    } else {
+                        format!("{}\n{}", stdout, stderr)
+                    };
+                    Some(combined)
+                }
+                Err(e) => {
+                    let msg = format!("error: {}", e);
+                    Some(msg)
+                }
+            }
+        } else {
+            None
+        };
+        ls.last_run_output = validation_output.clone();
+
+        if let Err(e) = crate::extras::r#loop::transcript::save_iteration(
+            &ui.session.id,
+            ls.iteration,
+            &ls.build_prompt(),
+            &response,
+            validation_output.as_deref(),
+            &summary,
+        ) {
+            renderer.write_line(
+                &format!("warning: failed to save loop transcript: {}", e),
+                C_ERROR,
+            )?;
+        }
+
+        ls.iteration += 1;
+
         if ls.should_stop() {
             renderer.write_line(
-                &format!("[loop] max iterations ({}) reached, stopping", ls.iteration),
+                &format!(
+                    "[loop] max iterations ({}) reached, stopping",
+                    ls.iteration - 1
+                ),
                 C_AGENT,
             )?;
             ls.active = false;
-            *loop_label = None;
+            chain.loop_label = None;
         } else {
-            let summary: String = response.chars().take(200).collect();
-            ls.last_summary = Some(summary);
-            ls.iteration += 1;
             let prompt = ls.build_prompt();
-            *agent = Some({
-                let model = client.completion_model(session.model.to_string());
-                crate::provider::build_agent(
-                    model,
-                    cli,
-                    cfg,
-                    context,
-                    permission.clone(),
-                    ask_tx.clone(),
-                    sandbox.clone(),
-                    true,
-                    #[cfg(feature = "mcp")]
-                    mcp_manager,
-                )
-                .await
-            });
-            let runner = agent
+            run.agent = Some(
+                ui.agent_build_ctx()
+                    .rebuild_agent(&ui.session.model, true)
+                    .await,
+            );
+            let runner = run
+                .agent
                 .as_ref()
                 .unwrap()
                 .clone()
-                .spawn_runner(prompt, Vec::new());
-            *agent_rx = Some(runner.event_rx);
-            *is_running = true;
-            *loop_label = Some(ls.iteration_label());
+                .spawn_runner(
+                    prompt,
+                    Vec::new(),
+                    ui.cfg.retry.clone(),
+                    #[cfg(feature = "hooks")]
+                    Some(crate::extras::hooks::LoopInfo {
+                        iteration: ls.iteration,
+                        active: ls.active,
+                    }),
+                )
+                .await;
+            run.agent_rx = Some(runner.event_rx);
+            run.is_running = true;
+            if let Some(ss) = ui.status_signals.as_ref() {
+                ss.send_start();
+            }
+            chain.loop_label = Some(ls.iteration_label());
             renderer.write_line(
                 &format!("[loop] launching {}", ls.iteration_label()),
                 C_AGENT,
@@ -454,34 +566,22 @@ async fn handle_agent_done(
         }
     }
 
-    // Drop the agent after each response – it will be rebuilt on the next user input.
-    // The git-worktree path below (wt_return_path) may reassign it, which is fine.
-    *agent = None;
-
     #[cfg(feature = "git-worktree")]
-    if let Some(main_path) = wt_return_path.take() {
+    if let Some((main_path, wt_path, branch, force)) = chain.wt_return_path.take() {
+        crate::extras::git_worktree::cleanup_worktree(&wt_path, &branch, &main_path, force);
         match std::env::set_current_dir(&main_path) {
             Ok(()) => {
-                session.working_dir = compact_str::CompactString::new(&main_path);
-                context.reload();
-                apply_current_prompt_mode(context, permission);
-                *agent = Some({
-                    let model = client.completion_model(session.model.to_string());
-                    crate::provider::build_agent(
-                        model,
-                        cli,
-                        cfg,
-                        context,
-                        permission.clone(),
-                        ask_tx.clone(),
-                        sandbox.clone(),
-                        true,
-                        #[cfg(feature = "mcp")]
-                        mcp_manager,
-                    )
-                    .await
-                });
-                crate::ui::events::render_session(renderer, session, cli, cfg, context)?;
+                ui.session.working_dir = compact_str::CompactString::new(&main_path);
+                ui.context.reload();
+                apply_current_prompt_mode(ui.context, &ui.permission);
+                run.agent = Some(
+                    ui.agent_build_ctx()
+                        .rebuild_agent(&ui.session.model, true)
+                        .await,
+                );
+                crate::ui::events::render_session(
+                    renderer, ui.session, ui.cli, ui.cfg, ui.context,
+                )?;
                 renderer.write_line(
                     &format!("merged and returned to main repo at {}", main_path),
                     C_AGENT,

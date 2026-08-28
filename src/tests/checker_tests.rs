@@ -219,6 +219,117 @@ fn doom_loop_resets_for_different_inputs() {
     assert!(matches!(result, CheckResult::Allowed));
 }
 
+#[test]
+fn doom_loop_detects_consecutive_repeats() {
+    let mut checker = make_checker(SecurityMode::Standard);
+    checker.check("bash", "ls");
+    checker.check("bash", "ls");
+    let result = checker.check("bash", "ls");
+    assert!(
+        matches!(result, CheckResult::AllowedWithCoaching(_)),
+        "three consecutive identical calls should trigger doom loop coaching, got {:?}",
+        result,
+    );
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn record_blocked_feeds_doom_loop_detection() {
+    let mut checker = make_checker(SecurityMode::Standard);
+    checker.record_blocked("bash", "ls -la");
+    checker.record_blocked("bash", "ls -la");
+    let result = checker.check("bash", "ls -la");
+    assert!(
+        matches!(result, CheckResult::AllowedWithCoaching(_)),
+        "a hook-denied call repeated via record_blocked should still count toward \
+         doom-loop detection, got {:?}",
+        result,
+    );
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn force_ask_once_forces_ask_for_the_next_call_regardless_of_mode() {
+    // Yolo would otherwise allow bash unconditionally.
+    let mut checker = make_checker(SecurityMode::Yolo);
+    checker.force_ask_once("bash".to_string());
+    let result = checker.check("bash", "ls -la");
+    assert!(matches!(result, CheckResult::Ask));
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn force_ask_once_is_consumed_after_one_call() {
+    let mut checker = make_checker(SecurityMode::Yolo);
+    checker.force_ask_once("bash".to_string());
+    let _ = checker.check("bash", "ls -la");
+    let result = checker.check("bash", "ls -la");
+    assert!(matches!(result, CheckResult::Allowed));
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn force_ask_once_never_overrides_a_deny_rule() {
+    let config = PermissionConfig {
+        bash: Some(ToolPerm::Granular({
+            let mut m = std::collections::HashMap::new();
+            m.insert("rm -rf important".to_string(), Action::Deny);
+            m
+        })),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Yolo,
+        Some(std::path::PathBuf::from("/home/user/project")),
+        default_modes(),
+    );
+    checker.force_ask_once("bash".to_string());
+    let result = checker.check("bash", "rm -rf important");
+    assert!(matches!(result, CheckResult::Denied(_)));
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn allow_once_suppresses_the_prompt_for_the_next_call() {
+    let mut checker = make_checker(SecurityMode::Restrictive);
+    checker.allow_once("bash".to_string());
+    let result = checker.check("bash", "ls -la");
+    assert!(matches!(result, CheckResult::Allowed));
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn allow_once_is_consumed_after_one_call() {
+    let mut checker = make_checker(SecurityMode::Restrictive);
+    checker.allow_once("bash".to_string());
+    let _ = checker.check("bash", "ls -la");
+    let result = checker.check("bash", "ls -la");
+    assert!(matches!(result, CheckResult::Ask));
+}
+
+#[cfg(feature = "hooks")]
+#[test]
+fn allow_once_never_overrides_a_deny_rule() {
+    let config = PermissionConfig {
+        bash: Some(ToolPerm::Granular({
+            let mut m = std::collections::HashMap::new();
+            m.insert("rm -rf important".to_string(), Action::Deny);
+            m
+        })),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Yolo,
+        Some(std::path::PathBuf::from("/home/user/project")),
+        default_modes(),
+    );
+    checker.allow_once("bash".to_string());
+    let result = checker.check("bash", "rm -rf important");
+    assert!(matches!(result, CheckResult::Denied(_)));
+}
+
 // --- Session allowlist ---
 
 #[test]
@@ -227,6 +338,31 @@ fn session_allowlist_bypasses_rules() {
     checker.add_session_allowlist("bash".into(), "cargo test **");
     let result = checker.check("bash", "cargo test --all");
     assert!(matches!(result, CheckResult::Allowed));
+}
+
+#[test]
+fn session_allowlist_cannot_bypass_deny_rules() {
+    // Security fix: deny rules must be evaluated before the session allowlist
+    // so that AllowAlways cannot bypass a deny rule.
+    let config = PermissionConfig {
+        bash: Some(ToolPerm::Granular(
+            [("rm *".to_string(), Action::Deny)].into_iter().collect(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        None,
+        default_modes(),
+    );
+    checker.add_session_allowlist("bash".into(), "rm *");
+    let result = checker.check("bash", "rm -rf important");
+    assert!(
+        matches!(result, CheckResult::Denied(_)),
+        "deny rule must not be bypassed by session allowlist, got {:?}",
+        result,
+    );
 }
 
 #[test]
@@ -842,18 +978,21 @@ fn yolo_unknown_bash_is_allowed() {
 }
 
 #[test]
-fn yolo_allows_write_todo_list() {
+fn yolo_allows_todo_write() {
     let mut checker = make_checker(SecurityMode::Yolo);
     assert!(matches!(
-        checker.check("write_todo_list", ""),
+        checker.check("todo_write", ""),
         CheckResult::Allowed
     ));
 }
 
 // --- MCP allow-all via checker ---
 
+#[cfg(feature = "mcp")]
 #[test]
-fn allow_all_mcp_overrides_deny_rules() {
+fn allow_all_mcp_does_not_override_deny_rules() {
+    // Security fix: deny rules are the baseline and must be evaluated before
+    // allow_all_mcp_calls so that deny rules cannot be bypassed.
     let config = PermissionConfig {
         mcp_tool: Some(ToolPerm::Simple(Action::Deny)),
         ..PermissionConfig::default()
@@ -867,12 +1006,13 @@ fn allow_all_mcp_overrides_deny_rules() {
     checker.set_allow_all_mcp_calls(true);
     let result = checker.check("mcp_tool", "mcp_tool:filesystem:read_file");
     assert!(
-        matches!(result, CheckResult::Allowed),
-        "expected Allowed for MCP tool when allow_all_mcp_calls is set, got {:?}",
+        matches!(result, CheckResult::Denied(_)),
+        "expected Denied for MCP tool with deny rule even when allow_all_mcp_calls is set, got {:?}",
         result,
     );
 }
 
+#[cfg(feature = "mcp")]
 #[test]
 fn allow_all_mcp_does_not_affect_non_mcp_tools() {
     let config = PermissionConfig {
@@ -894,49 +1034,49 @@ fn allow_all_mcp_does_not_affect_non_mcp_tools() {
     );
 }
 
-// --- write_todo_list always allowed ---
+// --- todo_write always allowed ---
 
 #[test]
-fn write_todo_list_always_allowed_in_restrictive() {
+fn todo_write_always_allowed_in_restrictive() {
     let mut checker = make_checker(SecurityMode::Restrictive);
     assert!(matches!(
-        checker.check("write_todo_list", ""),
+        checker.check("todo_write", ""),
         CheckResult::Allowed
     ));
 }
 
 #[test]
-fn write_todo_list_always_allowed_in_readonly() {
+fn todo_write_always_allowed_in_readonly() {
     let mut checker = make_checker(SecurityMode::ReadOnly);
     assert!(matches!(
-        checker.check("write_todo_list", ""),
+        checker.check("todo_write", ""),
         CheckResult::Allowed
     ));
 }
 
 #[test]
-fn write_todo_list_always_allowed_in_guarded() {
+fn todo_write_always_allowed_in_guarded() {
     let mut checker = make_checker(SecurityMode::Guarded);
     assert!(matches!(
-        checker.check("write_todo_list", ""),
+        checker.check("todo_write", ""),
         CheckResult::Allowed
     ));
 }
 
 #[test]
-fn write_todo_list_always_allowed_in_yolo() {
+fn todo_write_always_allowed_in_yolo() {
     let mut checker = make_checker(SecurityMode::Yolo);
     assert!(matches!(
-        checker.check("write_todo_list", ""),
+        checker.check("todo_write", ""),
         CheckResult::Allowed
     ));
 }
 
 #[test]
-fn write_todo_list_path_check_always_allowed() {
+fn todo_write_path_check_always_allowed() {
     let mut checker = make_checker(SecurityMode::Restrictive);
     assert!(matches!(
-        checker.check_path("write_todo_list", "/any/path"),
+        checker.check_path("todo_write", "/any/path"),
         CheckResult::Allowed
     ));
 }
@@ -971,8 +1111,10 @@ fn empty_permission_modes_skips_rules_for_all_modes() {
 
 #[test]
 fn standard_external_dir_allow_rule_overrides_default_ask() {
-    let mut config = PermissionConfig::default();
-    config.external_directory = Some([("/tmp/work/**".to_string(), Action::Allow)].into());
+    let config = PermissionConfig {
+        external_directory: Some([("/tmp/work/**".to_string(), Action::Allow)].into()),
+        ..PermissionConfig::default()
+    };
     let configs = configs_from(config);
     let mut checker = PermissionChecker::new(
         &configs,
@@ -991,8 +1133,10 @@ fn standard_external_dir_allow_rule_overrides_default_ask() {
 
 #[test]
 fn standard_external_dir_deny_rule_overrides_default_ask() {
-    let mut config = PermissionConfig::default();
-    config.external_directory = Some([("/etc/**".to_string(), Action::Deny)].into());
+    let config = PermissionConfig {
+        external_directory: Some([("/etc/**".to_string(), Action::Deny)].into()),
+        ..PermissionConfig::default()
+    };
     let configs = configs_from(config);
     let mut checker = PermissionChecker::new(
         &configs,
@@ -1210,6 +1354,135 @@ fn guarded_mcp_tool_asks_when_no_rule() {
     ));
 }
 
+// --- Read-equivalent MCP tools allowed in ReadOnly / PlanWrite ---
+
+#[test]
+fn readonly_allows_exa_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Exa Web Search:webfetch"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn planwrite_allows_exa_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::PlanWrite);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Exa Web Search:webfetch"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn readonly_allows_context7_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Context7:get_context"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Context7:search_docs"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn planwrite_allows_context7_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::PlanWrite);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Context7:get_context"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Context7:search_docs"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn readonly_allows_grepapp_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Grep.app:search_code"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Grep.app:search_repos"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn planwrite_allows_grepapp_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::PlanWrite);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Grep.app:search_code"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Grep.app:search_repos"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn readonly_case_insensitive_mcp_prefix_match() {
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:exa web search:websearch"),
+        CheckResult::Allowed,
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:CONTEXT7:some_tool"),
+        CheckResult::Allowed,
+    ));
+}
+
+#[test]
+fn readonly_denies_non_read_equivalent_mcp_tools() {
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:filesystem:write_file"),
+        CheckResult::Denied(_),
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:other_server:some_tool"),
+        CheckResult::Denied(_),
+    ));
+}
+
+#[test]
+fn readonly_denies_unrelated_prefix() {
+    let mut checker = make_checker(SecurityMode::ReadOnly);
+    // Similar-looking prefixes that don"t match read-equivalent servers
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:exa:websearch"),
+        CheckResult::Denied(_),
+    ));
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:context7extra:some_tool"),
+        CheckResult::Denied(_),
+    ));
+}
+
+#[test]
+fn standard_mode_still_allows_exa_mcp_via_default() {
+    let mut checker = make_checker(SecurityMode::Standard);
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
+        CheckResult::Allowed,
+    ));
+}
+
 // --- Standard mode respects config allow for specific paths ---
 
 #[test]
@@ -1232,4 +1505,26 @@ fn standard_respects_config_allow_over_cwd_auto_allow() {
         checker.check("bash", "pip install requests"),
         CheckResult::Allowed,
     ));
+}
+
+// --- check_perm non-interactive Ask denial (guards headless dispatch) ---
+
+#[tokio::test]
+async fn check_perm_denies_non_interactively_when_ask_tx_is_none_and_verdict_is_ask() {
+    // Guarded mode with no matching rule asks for non-read tools (see
+    // guarded_asks_for_write_and_bash above), so this checker's verdict for
+    // "write" is CheckResult::Ask.
+    let checker = make_checker(SecurityMode::Guarded);
+    let perm: Option<crate::permission::checker::PermCheck> =
+        Some(std::sync::Arc::new(std::sync::Mutex::new(checker)));
+    let ask_tx: Option<crate::permission::ask::AskSender> = None;
+
+    let result = crate::agent::tools::check_perm(&perm, &ask_tx, "write", "/etc/passwd").await;
+
+    match result {
+        Err(crate::agent::tools::ToolError::Msg(msg)) => {
+            assert_eq!(msg, "Permission denied (non-interactive mode)");
+        }
+        other => panic!("expected non-interactive Ask denial error, got {:?}", other),
+    }
 }

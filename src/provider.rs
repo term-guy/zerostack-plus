@@ -17,11 +17,15 @@ use crate::auth::{AuthResolver, ProviderKind};
 use crate::cli::Cli;
 use crate::config::{ApiStyle, Config, CustomProviderConfig};
 use crate::context::ContextFiles;
+#[cfg(any(feature = "hooks", feature = "subagents"))]
 use crate::event::AgentEvent;
+#[cfg(feature = "hooks")]
+use crate::extras::hooks::LoopInfo;
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
+use crate::retry::{self, RetryConfig};
 use crate::sandbox::Sandbox;
 use crate::session::SessionMessage;
 
@@ -37,8 +41,12 @@ pub fn resolve_provider_config(
     custom_providers: &HashMap<String, CustomProviderConfig>,
 ) -> anyhow::Result<ProviderConfig> {
     if let Some(custom) = custom_providers.get(name) {
-        let kind = ProviderKind::from_name(&custom.provider_type)
-            .ok_or_else(|| anyhow::anyhow!("Unknown provider type: {}", custom.provider_type))?;
+        let kind = ProviderKind::from_name(&custom.provider_type).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown provider type: {}. Run `zerostack --setup` to configure providers.",
+                custom.provider_type
+            )
+        })?;
         return Ok(ProviderConfig {
             kind,
             base_url: Some(custom.base_url.clone()),
@@ -48,7 +56,7 @@ pub fn resolve_provider_config(
     }
     let kind = ProviderKind::from_name(name).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown provider: '{}'. Supported: openrouter, openai, anthropic, gemini, ollama, deepseek",
+            "Unknown provider: '{}'. Supported: openrouter, openai, anthropic, gemini, ollama, deepseek. Run `zerostack --setup` to configure providers.",
             name
         )
     })?;
@@ -156,6 +164,48 @@ pub enum AnyClient {
     DeepSeek(deepseek::Client),
 }
 
+/// Extra OpenRouter request body params that pin a Claude model to the
+/// Anthropic direct route, or `None` for any non-Claude model.
+///
+/// `cache_control` breakpoints (used for prompt caching) are only honored on
+/// OpenRouter's Anthropic direct route; the Bedrock and Vertex routes silently
+/// drop them. So for Claude models we force `provider.order = ["Anthropic"]`
+/// (keeping `allow_fallbacks: true` so the request still succeeds if Anthropic
+/// is momentarily unavailable). Every other OpenRouter model caches
+/// automatically and is left untouched.
+///
+/// OpenRouter namespaces Claude under `anthropic/`, optionally with a leading
+/// `~` marking a floating "-latest" alias (e.g. `~anthropic/claude-sonnet-latest`).
+/// The `~` is part of the real slug, so strip it before matching.
+pub(crate) fn openrouter_anthropic_routing(model_id: &str) -> Option<serde_json::Value> {
+    let slug = model_id.strip_prefix('~').unwrap_or(model_id);
+    slug.starts_with("anthropic/").then(|| {
+        serde_json::json!({
+            "provider": { "order": ["Anthropic"], "allow_fallbacks": true }
+        })
+    })
+}
+
+/// Shallow-merges user-configured `extra_body` into provider-internal routing
+/// params (e.g. OpenRouter's `provider.order`). Top-level keys from `extra_body`
+/// win on collision. Returns `None` when both are absent so callers can avoid an
+/// empty `additional_params` call.
+pub(crate) fn merge_extra_body(
+    base: Option<serde_json::Value>,
+    extra: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (base, extra) {
+        (Some(serde_json::Value::Object(mut b)), Some(serde_json::Value::Object(e))) => {
+            b.extend(e);
+            Some(serde_json::Value::Object(b))
+        }
+        (base, None) => base,
+        (None, extra) => extra,
+        // Non-object base (shouldn't happen for routing) — user value takes over.
+        (Some(_), extra) => extra,
+    }
+}
+
 impl AnyClient {
     #[allow(dead_code)]
     pub fn provider_name(&self) -> &'static str {
@@ -172,9 +222,14 @@ impl AnyClient {
     pub fn completion_model(&self, name: impl Into<String>) -> AnyModel {
         let name = name.into();
         match self {
-            AnyClient::OpenRouter(c) => AnyModel::OpenRouter(c.completion_model(name)),
+            AnyClient::OpenRouter(c) => {
+                let extra = openrouter_anthropic_routing(&name);
+                AnyModel::OpenRouter(c.completion_model(name).with_prompt_caching(), extra)
+            }
             AnyClient::OpenAI(c) => AnyModel::OpenAI(c.completion_model(name)),
-            AnyClient::Anthropic(c) => AnyModel::Anthropic(c.completion_model(name)),
+            AnyClient::Anthropic(c) => {
+                AnyModel::Anthropic(c.completion_model(name).with_prompt_caching())
+            }
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::Ollama(c) => AnyModel::Ollama(c.completion_model(name)),
             AnyClient::DeepSeek(c) => AnyModel::DeepSeek(c.completion_model(name)),
@@ -189,13 +244,6 @@ impl AnyClient {
         instructions: Option<&str>,
     ) -> anyhow::Result<String> {
         let conversation = serialize_conversation(messages);
-        let conversation = if conversation.len() > 6000 {
-            let mut truncated = String::from(&conversation[..6000]);
-            truncated.push_str("\n\n... [truncated]");
-            truncated
-        } else {
-            conversation
-        };
 
         let prompt = prompt::COMPACTION_PROMPT
             .replace("{conversation}", &conversation)
@@ -213,7 +261,9 @@ pub struct ModelEntry {
     pub id: String,
     pub display: String,
     pub context_length: Option<u32>,
-    pub kind: Option<String>, // rig Model.r#type (often None)
+    pub kind: Option<String>,
+    pub input_price: Option<f64>,
+    pub output_price: Option<f64>,
 }
 
 impl ModelEntry {
@@ -223,6 +273,8 @@ impl ModelEntry {
             display: m.display_name().to_string(),
             context_length: m.context_length,
             kind: m.r#type.clone(),
+            input_price: None,
+            output_price: None,
         }
     }
 }
@@ -296,6 +348,20 @@ impl AnyClient {
     }
 }
 
+/// Response shape of `GET {base}/models` on OpenAI/OpenRouter-compatible
+/// gateways. Only `id` and `context_length` are read; everything else is
+/// ignored, so plain OpenAI-style endpoints (no `context_length`) parse fine.
+#[derive(serde::Deserialize)]
+struct ManualModelsResp {
+    data: Vec<ManualModelsItem>,
+}
+
+#[derive(serde::Deserialize)]
+struct ManualModelsItem {
+    id: String,
+    context_length: Option<u64>,
+}
+
 /// Custom / OpenAI-compatible gateway: best-effort GET {base}/models.
 pub async fn list_models_manual(
     provider_name: &str,
@@ -316,36 +382,150 @@ pub async fn list_models_manual(
         .resolve()
         .ok();
     let custom = custom_providers.get(provider_name);
-    let http = build_http_client(provider_name, config.danger_accept_invalid_certs, custom)?;
+    let http = build_http_client(
+        provider_name,
+        config.danger_accept_invalid_certs,
+        custom,
+        Some(&base),
+    )?;
     let url = format!("{}/models", base.trim_end_matches('/'));
+    tracing::debug!("list_models_manual: GET {}", url);
     let mut req = http.get(url);
     if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
     }
-    #[derive(serde::Deserialize)]
-    struct Resp {
-        data: Vec<Item>,
-    }
-    #[derive(serde::Deserialize)]
-    struct Item {
-        id: String,
-    }
-    let resp: Resp = req.send().await?.error_for_status()?.json().await?;
+    let body = req.send().await?.error_for_status()?.bytes().await?;
+    parse_manual_models(&body)
+}
+
+/// Parse a `GET {base}/models` payload from a custom / OpenAI-compatible
+/// gateway into picker entries. `context_length` is picked up when the
+/// gateway reports it (OpenRouter-style), `None` otherwise.
+pub(crate) fn parse_manual_models(body: &[u8]) -> anyhow::Result<Vec<ModelEntry>> {
+    let resp: ManualModelsResp = serde_json::from_slice(body)?;
     Ok(resp
         .data
         .into_iter()
         .map(|i| ModelEntry {
             display: i.id.clone(),
             id: i.id,
-            context_length: None,
+            context_length: i.context_length.map(|cl| cl as u32),
             kind: None,
+            input_price: None,
+            output_price: None,
         })
         .collect())
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct OpenRouterModelInfo {
+    pub input_cost: f64,
+    pub output_cost: f64,
+    pub context_length: Option<u64>,
+}
+
+/// Fetch per-model pricing and context length live from
+/// `GET {base_url}/models` for the built-in `openrouter` or any custom
+/// provider exposing an OpenRouter-style model listing (e.g. laroute).
+/// Returns an empty-map error only on transport/parse failure; providers
+/// whose listing carries no pricing/`context_length` simply yield no entries.
+pub async fn fetch_live_model_info(
+    provider_name: &str,
+    api_key: Option<&str>,
+    custom_providers: &HashMap<String, CustomProviderConfig>,
+    config_api_keys: Option<&HashMap<String, String>>,
+) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    let config = resolve_provider_config(provider_name, custom_providers)?;
+    let key = AuthResolver::new(config.kind)
+        .with_cli_key(api_key)
+        .with_env_override(config.api_key_env.as_deref())
+        .with_config_keys(config_api_keys)
+        .with_custom_provider_name(Some(provider_name))
+        .resolve()
+        .ok();
+    let custom = custom_providers.get(provider_name);
+    let base = config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string());
+    let http = build_http_client(
+        provider_name,
+        config.danger_accept_invalid_certs,
+        custom,
+        Some(&base),
+    )?;
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let mut req = http.get(url);
+    if let Some(k) = key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    let body = req.send().await?.error_for_status()?.bytes().await?;
+    parse_model_infos(&body)
+}
+
+/// A pricing value: OpenRouter serializes prices as strings, some compatible
+/// gateways (e.g. laroute) as plain numbers — accept both.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum StringOrNumber {
+    S(String),
+    N(f64),
+}
+
+impl StringOrNumber {
+    fn as_f64(&self) -> f64 {
+        match self {
+            Self::S(s) => s.parse().unwrap_or(0.0),
+            Self::N(n) => *n,
+        }
+    }
+}
+
+/// Parse an OpenRouter-style `GET /models` payload into per-model pricing
+/// (USD per token in the payload, returned per million tokens) and context
+/// length. Entries with no pricing and no `context_length` are skipped.
+pub(crate) fn parse_model_infos(
+    body: &[u8],
+) -> anyhow::Result<HashMap<String, OpenRouterModelInfo>> {
+    #[derive(serde::Deserialize)]
+    struct PricingResp {
+        prompt: StringOrNumber,
+        completion: StringOrNumber,
+    }
+    #[derive(serde::Deserialize)]
+    struct PricingEntry {
+        id: String,
+        pricing: Option<PricingResp>,
+        context_length: Option<u64>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PricingList {
+        data: Vec<PricingEntry>,
+    }
+    let resp: PricingList = serde_json::from_slice(body)?;
+    let mut map = HashMap::new();
+    for entry in resp.data {
+        let (input, output) = match entry.pricing.as_ref() {
+            Some(p) => (p.prompt.as_f64(), p.completion.as_f64()),
+            None => (0.0, 0.0),
+        };
+        if input > 0.0 || output > 0.0 || entry.context_length.is_some() {
+            map.insert(
+                entry.id,
+                OpenRouterModelInfo {
+                    input_cost: input * 1_000_000.0,
+                    output_cost: output * 1_000_000.0,
+                    context_length: entry.context_length,
+                },
+            );
+        }
+    }
+    Ok(map)
+}
+
 async fn summarize_with_model(model: AnyModel, prompt: String) -> anyhow::Result<String> {
     match model {
-        AnyModel::OpenRouter(m) => run_summarizer(m, prompt).await,
+        AnyModel::OpenRouter(m, _) => run_summarizer(m, prompt).await,
         AnyModel::OpenAI(m) => match m {
             OpenAiModel::Responses(m) => run_summarizer(m, prompt).await,
             OpenAiModel::Completions(m) => run_summarizer(m, prompt).await,
@@ -362,14 +542,28 @@ where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
+    let mut preamble = "You are a conversation summarizer.".to_string();
+    if let Some(s) = crate::session::storage::load_suffix() {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(&s);
+    }
+
     let agent = rig::agent::AgentBuilder::new(model)
-        .preamble("You are a conversation summarizer.")
+        .preamble(&preamble)
         .build();
 
-    let mut stream = agent
-        .stream_chat(prompt, Vec::<Message>::new())
-        .multi_turn(1)
-        .await;
+    let agent_ref = &agent;
+    let mut stream = retry::retry_stream_chat(&RetryConfig::default(), move || {
+        let p = prompt.clone();
+        async move {
+            agent_ref
+                .stream_chat(p, Vec::<Message>::new())
+                .max_turns(1)
+                .await
+        }
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Compression failed: {}", e))?;
 
     let mut response = String::new();
     use futures::StreamExt;
@@ -379,7 +573,7 @@ where
                 rig::streaming::StreamedAssistantContent::Text(text),
             )) => response.push_str(&text.text),
             Ok(rig::agent::MultiTurnStreamItem::FinalResponse(res)) => {
-                response = res.response().to_string();
+                response = res.output.to_string();
                 break;
             }
             Err(e) => return Err(anyhow::anyhow!("Compression failed: {}", e)),
@@ -394,13 +588,16 @@ where
     Ok(response)
 }
 
-fn serialize_conversation(messages: &[SessionMessage]) -> String {
+pub(crate) fn serialize_conversation(messages: &[SessionMessage]) -> String {
     let mut result = String::new();
     for msg in messages {
         let role_tag = match msg.role {
             crate::session::MessageRole::User => "User",
             crate::session::MessageRole::Assistant => "Assistant",
             crate::session::MessageRole::System => "System",
+            crate::session::MessageRole::ToolCall => "ToolCall",
+            crate::session::MessageRole::ToolResult => "ToolResult",
+            crate::session::MessageRole::SubagentToolCall => "SubagentToolCall",
         };
         result.push_str(&format!("[{}]: {}\n\n", role_tag, msg.content));
     }
@@ -408,7 +605,15 @@ fn serialize_conversation(messages: &[SessionMessage]) -> String {
 }
 
 pub enum AnyModel {
-    OpenRouter(openrouter::completion::CompletionModel),
+    /// The second field carries provider-specific extra body params. For
+    /// `anthropic/*` models routed via OpenRouter it pins `provider.order` to
+    /// the Anthropic direct route, the only route that honors `cache_control`
+    /// breakpoints (Bedrock/Vertex silently drop them). `None` for every other
+    /// OpenRouter model, which caches automatically and needs no routing.
+    OpenRouter(
+        openrouter::completion::CompletionModel,
+        Option<serde_json::Value>,
+    ),
     OpenAI(OpenAiModel),
     Anthropic(anthropic::completion::CompletionModel),
     Gemini(gemini::completion::CompletionModel),
@@ -424,29 +629,142 @@ pub enum AnyAgent {
     Gemini(Agent<gemini::completion::CompletionModel>),
     Ollama(Agent<ollama::CompletionModel>),
     DeepSeek(Agent<deepseek::CompletionModel>),
+    /// Scripted test double (`rig::test_utils::MockCompletionModel`), used by
+    /// headless main-loop integration tests; never constructed in production.
+    #[cfg(test)]
+    Mock(Agent<rig::test_utils::MockCompletionModel>),
+}
+
+/// Synthesizes an `AgentRunner` for a prompt blocked by a `UserPromptSubmit`
+/// hook: no model call happens, the block feedback surfaces through the same
+/// `AgentEvent::Error` path a real run-time error would use.
+#[cfg(feature = "hooks")]
+fn spawn_blocked_runner(feedback: String) -> AgentRunner {
+    let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(1);
+    let join = tokio::spawn(async move {
+        let _ = event_tx
+            .send(AgentEvent::Error(CompactString::from(feedback)))
+            .await;
+    });
+    AgentRunner {
+        event_rx,
+        abort_handle: join.abort_handle(),
+    }
 }
 
 impl AnyAgent {
     pub async fn run_print(
         &self,
         prompt: &str,
-        max_turns: usize,
         pure_stdout: bool,
-    ) -> anyhow::Result<String> {
+        retry_config: &RetryConfig,
+        // Prior turns from a resumed session; see `runner::run_print`. Empty
+        // for a fresh session.
+        history: Vec<Message>,
+        // `--loop` iteration/active state; see `runner::run_print`. `None`
+        // for plain `-p` one-shot runs.
+        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    ) -> anyhow::Result<runner::PrintOutcome> {
         match self {
-            AnyAgent::OpenRouter(a) => runner::run_print(a, prompt, max_turns, pure_stdout).await,
+            AnyAgent::OpenRouter(a) => {
+                runner::run_print(
+                    a,
+                    prompt,
+                    pure_stdout,
+                    retry_config,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+            }
             AnyAgent::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
-                    runner::run_print(a, prompt, max_turns, pure_stdout).await
+                    runner::run_print(
+                        a,
+                        prompt,
+                        pure_stdout,
+                        retry_config,
+                        history,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    )
+                    .await
                 }
                 OpenAiAgent::Completions(a) => {
-                    runner::run_print(a, prompt, max_turns, pure_stdout).await
+                    runner::run_print(
+                        a,
+                        prompt,
+                        pure_stdout,
+                        retry_config,
+                        history,
+                        #[cfg(feature = "hooks")]
+                        loop_info,
+                    )
+                    .await
                 }
             },
-            AnyAgent::Anthropic(a) => runner::run_print(a, prompt, max_turns, pure_stdout).await,
-            AnyAgent::Gemini(a) => runner::run_print(a, prompt, max_turns, pure_stdout).await,
-            AnyAgent::Ollama(a) => runner::run_print(a, prompt, max_turns, pure_stdout).await,
-            AnyAgent::DeepSeek(a) => runner::run_print(a, prompt, max_turns, pure_stdout).await,
+            AnyAgent::Anthropic(a) => {
+                runner::run_print(
+                    a,
+                    prompt,
+                    pure_stdout,
+                    retry_config,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+            }
+            AnyAgent::Gemini(a) => {
+                runner::run_print(
+                    a,
+                    prompt,
+                    pure_stdout,
+                    retry_config,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+            }
+            AnyAgent::Ollama(a) => {
+                runner::run_print(
+                    a,
+                    prompt,
+                    pure_stdout,
+                    retry_config,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+            }
+            AnyAgent::DeepSeek(a) => {
+                runner::run_print(
+                    a,
+                    prompt,
+                    pure_stdout,
+                    retry_config,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+            }
+            #[cfg(test)]
+            AnyAgent::Mock(a) => {
+                runner::run_print(
+                    a,
+                    prompt,
+                    pure_stdout,
+                    retry_config,
+                    history,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                )
+                .await
+            }
         }
     }
 
@@ -456,35 +774,127 @@ impl AnyAgent {
         prompt: &str,
         max_turns: usize,
         event_tx: Option<&mpsc::Sender<AgentEvent>>,
+        retry_config: &RetryConfig,
     ) -> anyhow::Result<String> {
         match self {
-            AnyAgent::OpenRouter(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
+            AnyAgent::OpenRouter(a) => {
+                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            }
             AnyAgent::OpenAI(a) => match a {
                 OpenAiAgent::Responses(a) => {
-                    runner::run_subagent(a, prompt, max_turns, event_tx).await
+                    runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
                 }
                 OpenAiAgent::Completions(a) => {
-                    runner::run_subagent(a, prompt, max_turns, event_tx).await
+                    runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
                 }
             },
-            AnyAgent::Anthropic(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
-            AnyAgent::Gemini(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
-            AnyAgent::Ollama(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
-            AnyAgent::DeepSeek(a) => runner::run_subagent(a, prompt, max_turns, event_tx).await,
+            AnyAgent::Anthropic(a) => {
+                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            }
+            AnyAgent::Gemini(a) => {
+                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            }
+            AnyAgent::Ollama(a) => {
+                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            }
+            AnyAgent::DeepSeek(a) => {
+                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            }
+            #[cfg(test)]
+            AnyAgent::Mock(a) => {
+                runner::run_subagent(a, prompt, max_turns, event_tx, retry_config).await
+            }
         }
     }
 
-    pub fn spawn_runner(self, prompt: String, history: Vec<Message>) -> AgentRunner {
+    /// Async because, under `hooks`, the `UserPromptSubmit` gate must resolve
+    /// before spawning: its outcome decides whether the runner spawns at all
+    /// (a hook can block the prompt outright) and, if so, with what prompt
+    /// (a hook can rewrite it).
+    pub async fn spawn_runner(
+        self,
+        prompt: String,
+        history: Vec<Message>,
+        retry_config: RetryConfig,
+        // `--loop` iteration/active state; see `runner::spawn_agent`. `None`
+        // outside loop mode.
+        #[cfg(feature = "hooks")] loop_info: Option<LoopInfo>,
+    ) -> AgentRunner {
+        #[cfg(feature = "hooks")]
+        let prompt = match crate::extras::hooks::dispatch_user_prompt_submit(prompt).await {
+            crate::extras::hooks::PromptGate::Blocked(feedback) => {
+                return spawn_blocked_runner(feedback);
+            }
+            crate::extras::hooks::PromptGate::Proceed(prompt) => prompt,
+        };
         match self {
-            AnyAgent::OpenRouter(a) => runner::spawn_agent(a, prompt, history),
+            AnyAgent::OpenRouter(a) => runner::spawn_agent(
+                a,
+                prompt,
+                history,
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
             AnyAgent::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => runner::spawn_agent(a, prompt, history),
-                OpenAiAgent::Completions(a) => runner::spawn_agent(a, prompt, history),
+                OpenAiAgent::Responses(a) => runner::spawn_agent(
+                    a,
+                    prompt,
+                    history,
+                    retry_config,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                ),
+                OpenAiAgent::Completions(a) => runner::spawn_agent(
+                    a,
+                    prompt,
+                    history,
+                    retry_config,
+                    #[cfg(feature = "hooks")]
+                    loop_info,
+                ),
             },
-            AnyAgent::Anthropic(a) => runner::spawn_agent(a, prompt, history),
-            AnyAgent::Gemini(a) => runner::spawn_agent(a, prompt, history),
-            AnyAgent::Ollama(a) => runner::spawn_agent(a, prompt, history),
-            AnyAgent::DeepSeek(a) => runner::spawn_agent(a, prompt, history),
+            AnyAgent::Anthropic(a) => runner::spawn_agent(
+                a,
+                prompt,
+                history,
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
+            AnyAgent::Gemini(a) => runner::spawn_agent(
+                a,
+                prompt,
+                history,
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
+            AnyAgent::Ollama(a) => runner::spawn_agent(
+                a,
+                prompt,
+                history,
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
+            AnyAgent::DeepSeek(a) => runner::spawn_agent(
+                a,
+                prompt,
+                history,
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
+            #[cfg(test)]
+            AnyAgent::Mock(a) => runner::spawn_agent(
+                a,
+                prompt,
+                history,
+                retry_config,
+                #[cfg(feature = "hooks")]
+                loop_info,
+            ),
         }
     }
 
@@ -494,17 +904,34 @@ impl AnyAgent {
         history: Vec<Message>,
         event_tx: mpsc::Sender<crate::event::BtwEvent>,
         id: u32,
+        retry_config: RetryConfig,
     ) -> crate::agent::runner::BtwRunner {
         match self {
-            AnyAgent::OpenRouter(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            AnyAgent::OpenRouter(a) => {
+                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+            }
             AnyAgent::OpenAI(a) => match a {
-                OpenAiAgent::Responses(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
-                OpenAiAgent::Completions(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+                OpenAiAgent::Responses(a) => {
+                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                }
+                OpenAiAgent::Completions(a) => {
+                    runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+                }
             },
-            AnyAgent::Anthropic(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
-            AnyAgent::Gemini(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
-            AnyAgent::Ollama(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
-            AnyAgent::DeepSeek(a) => runner::spawn_btw(a, prompt, history, event_tx, id),
+            AnyAgent::Anthropic(a) => {
+                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+            }
+            AnyAgent::Gemini(a) => {
+                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+            }
+            AnyAgent::Ollama(a) => {
+                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+            }
+            AnyAgent::DeepSeek(a) => {
+                runner::spawn_btw(a, prompt, history, event_tx, id, retry_config)
+            }
+            #[cfg(test)]
+            AnyAgent::Mock(a) => runner::spawn_btw(a, prompt, history, event_tx, id, retry_config),
         }
     }
 }
@@ -535,16 +962,16 @@ pub(crate) fn build_http_client(
     provider_name: &str,
     danger_accept_invalid_certs: bool,
     custom: Option<&CustomProviderConfig>,
+    base_url: Option<&str>,
 ) -> anyhow::Result<reqwest::Client> {
-    // Disable connection pooling. Local LLM servers (notably llama.cpp's
-    // cpp-httplib) close idle keep-alive connections far faster than
-    // reqwest's default 90s pool_idle_timeout, leaving stale half-closed
-    // sockets in the pool. Reusing one of those manifests as
-    // "error sending request" with no corresponding entry server-side
-    // because no request actually reaches the server. TCP setup time is
-    // negligible compared to inference time, so fresh connections per
-    // request are a strict win for this workload.
-    let mut builder = reqwest::Client::builder().pool_max_idle_per_host(0);
+    let mut builder = reqwest::Client::builder();
+    if is_localhost(base_url) {
+        // Disable connection pooling for local LLM servers (notably
+        // llama.cpp's cpp-httplib) which close idle keep-alive
+        // connections far faster than reqwest's default 90s
+        // pool_idle_timeout, leaving stale half-closed sockets.
+        builder = builder.pool_max_idle_per_host(0);
+    }
 
     if let Some(cfg) = custom {
         if !cfg.headers.is_empty() {
@@ -574,6 +1001,14 @@ pub(crate) fn build_http_client(
     }
 
     builder.build().map_err(Into::into)
+}
+
+fn is_localhost(url: Option<&str>) -> bool {
+    url.is_some_and(|u| {
+        u.starts_with("http://localhost")
+            || u.starts_with("http://127.")
+            || u.starts_with("http://[::1]")
+    })
 }
 
 /// Determines which API style the OpenAI family should use:
@@ -654,8 +1089,12 @@ pub fn create_client(
     match config.kind {
         ProviderKind::OpenAI => {
             let custom = custom_providers.get(provider_name);
-            let http_client =
-                build_http_client(provider_name, config.danger_accept_invalid_certs, custom)?;
+            let http_client = build_http_client(
+                provider_name,
+                config.danger_accept_invalid_certs,
+                custom,
+                base_url.as_deref(),
+            )?;
             Ok(AnyClient::OpenAI(build_openai_client(
                 &key,
                 base_url.as_deref(),
@@ -700,7 +1139,18 @@ fn build_ollama_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyC
 }
 
 fn build_openrouter_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
-    build_provider_client!(openrouter::Client, OpenRouter, key, base_url)
+    // Expanded from `build_provider_client!` so we can chain OpenRouter's
+    // builder-only app-identity calls: these set `X-OpenRouter-Title` /
+    // `HTTP-Referer` / `X-OpenRouter-Categories` so zerostack's traffic is
+    // attributed in OpenRouter's dashboards instead of showing up anonymously.
+    let builder = match base_url {
+        Some(u) => openrouter::Client::builder().api_key(key).base_url(u),
+        None => openrouter::Client::builder().api_key(key),
+    };
+    let builder = builder
+        .with_app_identity("zerostack", "https://github.com/gi-dellav/zerostack")
+        .with_app_categories(&["cli-agent", "coding"]);
+    Ok(AnyClient::OpenRouter(builder.build()?))
 }
 
 fn build_deepseek_client(key: &str, base_url: Option<&str>) -> anyhow::Result<AnyClient> {
@@ -722,6 +1172,8 @@ async fn build_openai_agent(
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     reasoning_enabled: bool,
+    temperature: Option<f64>,
+    extra_body: Option<serde_json::Value>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> OpenAiAgent {
     match model {
@@ -735,6 +1187,8 @@ async fn build_openai_agent(
                 ask_tx,
                 sandbox,
                 reasoning_enabled,
+                temperature,
+                extra_body,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -750,6 +1204,8 @@ async fn build_openai_agent(
                 ask_tx,
                 sandbox,
                 reasoning_enabled,
+                temperature,
+                extra_body,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -768,10 +1224,12 @@ pub async fn build_agent(
     ask_tx: Option<AskSender>,
     sandbox: Sandbox,
     reasoning_enabled: bool,
+    temperature: Option<f64>,
+    extra_body: Option<serde_json::Value>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
 ) -> AnyAgent {
     match model {
-        AnyModel::OpenRouter(m) => AnyAgent::OpenRouter(
+        AnyModel::OpenRouter(m, routing) => AnyAgent::OpenRouter(
             builder::build_agent_inner(
                 m,
                 cli,
@@ -781,6 +1239,8 @@ pub async fn build_agent(
                 ask_tx,
                 sandbox.clone(),
                 reasoning_enabled,
+                temperature,
+                merge_extra_body(routing, extra_body),
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -796,6 +1256,8 @@ pub async fn build_agent(
                 ask_tx,
                 sandbox.clone(),
                 reasoning_enabled,
+                temperature,
+                extra_body,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -811,6 +1273,8 @@ pub async fn build_agent(
                 ask_tx,
                 sandbox.clone(),
                 reasoning_enabled,
+                temperature,
+                extra_body,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -826,6 +1290,8 @@ pub async fn build_agent(
                 ask_tx,
                 sandbox.clone(),
                 reasoning_enabled,
+                temperature,
+                extra_body,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -856,6 +1322,8 @@ pub async fn build_agent(
                 ask_tx,
                 sandbox,
                 reasoning_enabled,
+                temperature,
+                extra_body,
                 #[cfg(feature = "mcp")]
                 mcp_manager,
             )
@@ -865,6 +1333,7 @@ pub async fn build_agent(
 }
 
 /// Builds the isolated, tool-less `/btw` agent for the active provider.
+#[allow(clippy::too_many_arguments)]
 pub fn build_btw_agent(
     model: AnyModel,
     cli: &Cli,
@@ -873,9 +1342,11 @@ pub fn build_btw_agent(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     reasoning_enabled: bool,
+    temperature: Option<f64>,
+    extra_body: Option<serde_json::Value>,
 ) -> AnyAgent {
     match model {
-        AnyModel::OpenRouter(m) => AnyAgent::OpenRouter(builder::build_btw_agent_inner(
+        AnyModel::OpenRouter(m, routing) => AnyAgent::OpenRouter(builder::build_btw_agent_inner(
             m,
             cli,
             cfg,
@@ -883,6 +1354,8 @@ pub fn build_btw_agent(
             permission,
             ask_tx,
             reasoning_enabled,
+            temperature,
+            merge_extra_body(routing, extra_body),
         )),
         AnyModel::OpenAI(m) => AnyAgent::OpenAI(match m {
             OpenAiModel::Responses(m) => OpenAiAgent::Responses(builder::build_btw_agent_inner(
@@ -893,6 +1366,8 @@ pub fn build_btw_agent(
                 permission,
                 ask_tx,
                 reasoning_enabled,
+                temperature,
+                extra_body,
             )),
             OpenAiModel::Completions(m) => {
                 OpenAiAgent::Completions(builder::build_btw_agent_inner(
@@ -903,6 +1378,8 @@ pub fn build_btw_agent(
                     permission,
                     ask_tx,
                     reasoning_enabled,
+                    temperature,
+                    extra_body,
                 ))
             }
         }),
@@ -914,6 +1391,8 @@ pub fn build_btw_agent(
             permission,
             ask_tx,
             reasoning_enabled,
+            temperature,
+            extra_body,
         )),
         AnyModel::Gemini(m) => AnyAgent::Gemini(builder::build_btw_agent_inner(
             m,
@@ -923,6 +1402,8 @@ pub fn build_btw_agent(
             permission,
             ask_tx,
             reasoning_enabled,
+            temperature,
+            extra_body,
         )),
         AnyModel::Ollama(m) => AnyAgent::Ollama(builder::build_btw_agent_inner(
             m,
@@ -932,6 +1413,8 @@ pub fn build_btw_agent(
             permission,
             ask_tx,
             reasoning_enabled,
+            temperature,
+            extra_body,
         )),
         AnyModel::DeepSeek(m) => AnyAgent::DeepSeek(builder::build_btw_agent_inner(
             m,

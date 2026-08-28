@@ -1,12 +1,11 @@
 use chrono::Datelike;
 use compact_str::CompactString;
-use crossterm::style::Color;
 
 use crate::cli::Cli;
-use crate::config::Config;
+use crate::config::{Config, ResolvedShowToolDetails};
 use crate::context::ContextFiles;
 use crate::session::{MessageRole, Session};
-use crate::ui::markdown;
+use crate::ui::feed::BlockStyle;
 use crate::ui::renderer::Renderer;
 
 pub fn format_time(rfc3339: &str) -> CompactString {
@@ -34,26 +33,20 @@ pub fn render_session(
     context: &ContextFiles,
 ) -> anyhow::Result<()> {
     renderer.clear_content()?;
-    let welcome = format!(
-        "zerostack {}  {}  {}",
-        cli.resolve_provider(cfg),
-        cli.resolve_model(cfg),
-        env!("CARGO_PKG_VERSION")
-    );
-    renderer.write_line(&welcome, Color::Cyan)?;
-    renderer.write_line("", Color::White)?;
+    let feed = renderer.feed_mut();
     if context.agents.is_some() {
-        renderer.write_line("loaded AGENTS.md", Color::DarkGrey)?;
-        renderer.write_line("", Color::White)?;
+        feed.push_line(BlockStyle::System, "[system] loaded AGENTS.md");
+        feed.push_line(BlockStyle::Plain, "");
     }
     #[cfg(feature = "archmd")]
     if context.architecture.is_some() {
-        renderer.write_line("loaded ARCHITECTURE.md", Color::DarkGrey)?;
-        renderer.write_line("", Color::White)?;
+        feed.push_line(BlockStyle::System, "[system] loaded ARCHITECTURE.md");
+        feed.push_line(BlockStyle::Plain, "");
     }
     if !session.compactions.is_empty() {
-        renderer.write_line(
-            &format!(
+        feed.push_line(
+            BlockStyle::System,
+            format!(
                 "compacted {} times (saved ~{} tokens)",
                 session.compactions.len(),
                 session
@@ -62,82 +55,190 @@ pub fn render_session(
                     .map(|c| c.token_savings)
                     .unwrap_or(0),
             ),
-            Color::DarkGrey,
-        )?;
-        renderer.write_line("", Color::White)?;
+        );
+        feed.push_line(BlockStyle::Plain, "");
     }
     for msg in &session.messages {
-        let (prefix, _c) = match msg.role {
-            MessageRole::User => (">", Color::Green),
-            MessageRole::Assistant => ("<", Color::White),
-            MessageRole::System => ("#", Color::DarkGrey),
-        };
-        if msg.role == MessageRole::Assistant {
-            let max_width = renderer.line_width();
-            let mut styled = markdown::markdown_to_styled(&msg.content, max_width);
-            if !styled.is_empty() {
-                styled[0].text = CompactString::from(format!("{} {}", prefix, styled[0].text));
+        match msg.role {
+            MessageRole::User => {
+                for line in msg.content.lines() {
+                    feed.push_line(BlockStyle::User, format!("> {}", line));
+                }
             }
-            for entry in styled {
-                renderer.write_line(&entry.text, entry.color)?;
+            MessageRole::Assistant => {
+                feed.push_block(BlockStyle::Agent, msg.content.to_string());
             }
-        } else {
-            for line in msg.content.lines() {
-                renderer.write_line(&format!("{} {}", prefix, line), _c)?;
+            MessageRole::System => {
+                for line in msg.content.lines() {
+                    feed.push_line(BlockStyle::System, format!("# {}", line));
+                }
+            }
+            MessageRole::ToolCall => {
+                for line in msg.content.lines() {
+                    feed.push_line(BlockStyle::Tool, format!("◈ {}", line));
+                }
+            }
+            MessageRole::ToolResult => {
+                render_tool_result_to_feed(feed, &msg.content, cfg)?;
+            }
+            MessageRole::SubagentToolCall => {
+                for line in msg.content.lines() {
+                    feed.push_line(BlockStyle::Tool, format!("⌥ {}", line));
+                }
             }
         }
-        renderer.write_line("", Color::White)?;
+        feed.push_line(BlockStyle::Plain, "");
+    }
+    if session.messages.is_empty() {
+        let cwd = std::env::current_dir().ok();
+        let cwd_str = cwd
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(".");
+        feed.push_line(
+            BlockStyle::Welcome,
+            format!(
+                "[>] zerostack {} | {} | {}",
+                env!("CARGO_PKG_VERSION"),
+                cli.resolve_model(cfg),
+                cwd_str,
+            ),
+        );
+        feed.push_line(
+            BlockStyle::Welcome,
+            "──────────────────────────────────────────────────",
+        );
+        feed.push_line(
+            BlockStyle::Welcome,
+            "Ready to code; type a request or '/' for commands",
+        );
+        feed.push_line(BlockStyle::Welcome, "Run /welcome or /tutor to get started");
+        feed.push_line(BlockStyle::Plain, "");
+        feed.push_line(BlockStyle::Plain, "");
+    }
+    Ok(())
+}
+
+fn render_tool_result_to_feed(
+    feed: &mut crate::ui::feed::Feed,
+    content: &str,
+    cfg: &Config,
+) -> anyhow::Result<()> {
+    let output = content
+        .split_once(":\n")
+        .map(|(_, output)| output)
+        .unwrap_or(content);
+    let show_details = cfg
+        .show_tool_details
+        .as_ref()
+        .map(|s| s.resolve())
+        .unwrap_or(ResolvedShowToolDetails::Limited(3));
+    match show_details {
+        ResolvedShowToolDetails::Off => {
+            feed.push_line(
+                BlockStyle::ToolResult,
+                "◈ result hidden by show_tool_details=false",
+            );
+        }
+        ResolvedShowToolDetails::Limited(max_lines) => {
+            let sanitized = sanitize_output(output);
+            let char_count = sanitized.chars().count();
+            let lines: Vec<&str> = sanitized.lines().collect();
+            if lines.len() > max_lines {
+                let shown = lines[..max_lines].join("\n");
+                feed.push_line(
+                    BlockStyle::ToolResult,
+                    format!(
+                        "◈ result ({} chars, {} lines, showing {}):\n{}",
+                        char_count,
+                        lines.len(),
+                        max_lines,
+                        shown
+                    ),
+                );
+            } else {
+                feed.push_line(
+                    BlockStyle::ToolResult,
+                    format!("◈ result ({} chars):\n{}", char_count, sanitized),
+                );
+            }
+        }
+        ResolvedShowToolDetails::Unlimited => {
+            let sanitized = sanitize_output(output);
+            let char_count = sanitized.chars().count();
+            feed.push_line(
+                BlockStyle::ToolResult,
+                format!("◈ result ({} chars):\n{}", char_count, sanitized),
+            );
+        }
     }
     Ok(())
 }
 
 pub fn show_welcome(renderer: &mut Renderer) -> std::io::Result<()> {
-    use super::C_TOOL;
-    use crossterm::style::Color;
-
-    renderer.write_line("──────────────────────────────────────────", Color::Cyan)?;
-    renderer.write_line("  zerostack Quickstart", Color::Cyan)?;
-    renderer.write_line("──────────────────────────────────────────", Color::Cyan)?;
-    renderer.write_line("", Color::White)?;
-    renderer.write_line("  Pickers:", C_TOOL)?;
-    renderer.write_line(
+    let feed = renderer.feed_mut();
+    feed.push_line(
+        BlockStyle::Welcome,
+        "──────────────────────────────────────────",
+    );
+    feed.push_line(BlockStyle::Welcome, "  zerostack Quickstart");
+    feed.push_line(
+        BlockStyle::Welcome,
+        "──────────────────────────────────────────",
+    );
+    feed.push_line(BlockStyle::Plain, "");
+    feed.push_line(BlockStyle::Tool, "  Pickers:");
+    feed.push_line(
+        BlockStyle::Plain,
         "    @<path>     File picker / auto-complete paths",
-        Color::White,
-    )?;
-    renderer.write_line(
+    );
+    feed.push_line(
+        BlockStyle::Plain,
         "    !<command>  Run a shell command (output stored as assistant)",
-        Color::White,
-    )?;
-    renderer.write_line(
+    );
+    feed.push_line(
+        BlockStyle::Plain,
         "    .<prompt>   Switch prompt or one-shot .<prompt> <message>",
-        Color::White,
-    )?;
-    renderer.write_line("", Color::White)?;
-    renderer.write_line("  Slash Commands:", C_TOOL)?;
-    renderer.write_line("    /model        Switch model", Color::White)?;
-    renderer.write_line("    /prompt       List / activate prompts", Color::White)?;
-    renderer.write_line(
+    );
+    feed.push_line(BlockStyle::Plain, "");
+    feed.push_line(BlockStyle::Tool, "  Slash Commands:");
+    feed.push_line(BlockStyle::Plain, "    /model        Switch model");
+    feed.push_line(
+        BlockStyle::Plain,
+        "    /prompt       List / activate prompts",
+    );
+    feed.push_line(
+        BlockStyle::Plain,
         "    .autoconfig        Switches to auto-configurator",
-        Color::White,
-    )?;
-    renderer.write_line("    /mode         Change security mode", Color::White)?;
-    renderer.write_line("    /clear        Clear session", Color::White)?;
-    renderer.write_line("    /undo         Undo last exchange", Color::White)?;
-    renderer.write_line("    /compress     Free context window space", Color::White)?;
-    renderer.write_line("    /help         Show all commands", Color::White)?;
-    renderer.write_line("", Color::White)?;
-    renderer.write_line("  Keybindings:", C_TOOL)?;
-    renderer.write_line("    Ctrl+G     Open input in $EDITOR", Color::White)?;
-    renderer.write_line("    Ctrl+H     Launch lazygit", Color::White)?;
-    renderer.write_line("    Ctrl+S     Save session", Color::White)?;
-    renderer.write_line("    Tab        File picker / auto-complete", Color::White)?;
-    renderer.write_line(
+    );
+    feed.push_line(BlockStyle::Plain, "    /mode         Change security mode");
+    feed.push_line(BlockStyle::Plain, "    /clear        Clear session");
+    feed.push_line(BlockStyle::Plain, "    /undo         Undo last exchange");
+    feed.push_line(
+        BlockStyle::Plain,
+        "    /compress     Free context window space",
+    );
+    feed.push_line(BlockStyle::Plain, "    /help         Show all commands");
+    feed.push_line(BlockStyle::Plain, "");
+    feed.push_line(BlockStyle::Tool, "  Keybindings:");
+    feed.push_line(BlockStyle::Plain, "    Ctrl+G     Open input in $EDITOR");
+    feed.push_line(BlockStyle::Plain, "    Ctrl+H     Launch lazygit");
+    feed.push_line(BlockStyle::Plain, "    Ctrl+S     Save session");
+    feed.push_line(
+        BlockStyle::Plain,
+        "    Tab        File picker / auto-complete",
+    );
+    feed.push_line(
+        BlockStyle::Plain,
         "  Website: https://gi-dellav.github.io/zerostack/",
-        Color::White,
-    )?;
-    renderer.write_line("", Color::White)?;
-    renderer.write_line("──────────────────────────────────────────", Color::Cyan)?;
-    renderer.write_line("", Color::White)?;
+    );
+    feed.push_line(BlockStyle::Plain, "");
+    feed.push_line(
+        BlockStyle::Welcome,
+        "──────────────────────────────────────────",
+    );
+    feed.push_line(BlockStyle::Plain, "");
     Ok(())
 }
 

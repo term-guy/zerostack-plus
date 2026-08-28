@@ -55,6 +55,12 @@ pub(crate) async fn fetch_models_cached(
             return Ok(arc);
         }
     }
+    tracing::debug!(
+        "fetching model list for provider '{}' over the network (custom={}, refresh={})",
+        provider,
+        is_custom,
+        refresh
+    );
     let mut models = if is_custom {
         list_models_manual(
             provider,
@@ -67,6 +73,30 @@ pub(crate) async fn fetch_models_cached(
         client.list_models().await?
     };
     models.retain(crate::provider::is_agent_model);
+
+    if provider == "openrouter" || is_custom {
+        match crate::provider::fetch_live_model_info(
+            provider,
+            cli.api_key.as_deref(),
+            &cfg.custom_providers_map(),
+            cfg.api_keys.as_ref(),
+        )
+        .await
+        {
+            Ok(prices) => {
+                for m in &mut models {
+                    if let Some(info) = prices.get(&m.id) {
+                        m.input_price = Some(info.input_cost);
+                        m.output_price = Some(info.output_cost);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to fetch live model info for {provider}: {e}");
+            }
+        }
+    }
+
     let arc: Arc<[ModelEntry]> = Arc::from(models.into_boxed_slice());
     MODEL_CACHE
         .lock()
@@ -93,29 +123,95 @@ pub(crate) async fn warm_model_cache(
     cli: &Cli,
     cfg: &Config,
 ) -> Vec<String> {
-    let _ = fetch_models_cached(provider, is_custom, client, cli, cfg, false).await;
+    let start = std::time::Instant::now();
+    match fetch_models_cached(provider, is_custom, client, cli, cfg, false).await {
+        Ok(models) => {
+            tracing::debug!(
+                "model list for '{}': {} entries in {:?}",
+                provider,
+                models.len(),
+                start.elapsed()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "model list fetch for '{}' failed after {:?}: {}",
+                provider,
+                start.elapsed(),
+                e
+            );
+        }
+    }
     cached_model_ids(provider)
+}
+
+fn lookup_pricing_from_cache(provider: &str, model_id: &str) -> Option<(f64, f64)> {
+    MODEL_CACHE
+        .lock()
+        .unwrap()
+        .get(provider)
+        .and_then(|models| {
+            models.iter().find_map(|m| {
+                if m.id == model_id {
+                    m.input_price.zip(m.output_price).or_else(|| {
+                        crate::models_catalog::catalog_entries(provider).and_then(|entries| {
+                            entries.iter().find_map(|e| {
+                                if e.id == model_id {
+                                    e.input_price.zip(e.output_price)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                    })
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 async fn apply_model(ctx: &mut SlashCtx<'_>, model_id: &str) {
     let new_model = compact_str::CompactString::new(model_id);
-    let model = ctx.client.completion_model(new_model.to_string());
-    *ctx.agent = Some(
-        crate::provider::build_agent(
-            model,
-            ctx.cli,
-            ctx.cfg,
-            ctx.context,
-            ctx.permission.clone(),
-            ctx.ask_tx.clone(),
-            ctx.sandbox.clone(),
-            *ctx.reasoning_enabled,
-            #[cfg(feature = "mcp")]
-            ctx.mcp_manager,
-        )
-        .await,
-    );
+    let new_agent = ctx
+        .agent_build_ctx()
+        .rebuild_agent(&new_model, *ctx.reasoning_enabled)
+        .await;
+    *ctx.agent = Some(new_agent);
     ctx.session.model = new_model.clone();
+    ctx.session
+        .update_context_window(ctx.cfg.resolve_context_window(
+            &ctx.session.provider,
+            &new_model,
+            &crate::config::quick_models_map(ctx.cfg),
+        ));
+    if let Some((input, output)) = lookup_pricing_from_cache(&ctx.session.provider, model_id) {
+        ctx.session.input_token_cost = input;
+        ctx.session.output_token_cost = output;
+    } else if (ctx.session.provider == "openrouter"
+        || ctx
+            .cfg
+            .custom_providers_map()
+            .contains_key(ctx.session.provider.as_str()))
+        && let Ok(prices) = crate::provider::fetch_live_model_info(
+            &ctx.session.provider,
+            ctx.cli.api_key.as_deref(),
+            &ctx.cfg.custom_providers_map(),
+            ctx.cfg.api_keys.as_ref(),
+        )
+        .await
+        && let Some(info) = prices.get(model_id)
+    {
+        ctx.session.input_token_cost = info.input_cost;
+        ctx.session.output_token_cost = info.output_cost;
+        if ctx.cfg.context_window.is_none()
+            && crate::config::Config::catalog_context_window(&ctx.session.provider, model_id)
+                .is_none()
+            && let Some(cw) = info.context_length
+        {
+            ctx.session.update_context_window(cw);
+        }
+    }
     write_ok(ctx.renderer, format!("switched to model: {}", new_model));
 }
 
@@ -151,6 +247,12 @@ async fn handle_provider(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
     ctx.rebuild_agent_with_client(new_provider, *ctx.reasoning_enabled)
         .await?;
     ctx.session.provider = compact_str::CompactString::new(new_provider);
+    ctx.session
+        .update_context_window(ctx.cfg.resolve_context_window(
+            new_provider,
+            &ctx.session.model,
+            &crate::config::quick_models_map(ctx.cfg),
+        ));
     write_ok(
         ctx.renderer,
         format!(
@@ -170,24 +272,46 @@ async fn handle_model(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
         return Ok(());
     }
     let new_model = compact_str::CompactString::new(parts[1].trim());
-    let model = ctx.client.completion_model(new_model.to_string());
-    *ctx.agent = Some(
-        crate::provider::build_agent(
-            model,
-            ctx.cli,
-            ctx.cfg,
-            ctx.context,
-            ctx.permission.clone(),
-            ctx.ask_tx.clone(),
-            ctx.sandbox.clone(),
-            *ctx.reasoning_enabled,
-            #[cfg(feature = "mcp")]
-            ctx.mcp_manager,
-        )
-        .await,
-    );
+    let new_agent = ctx
+        .agent_build_ctx()
+        .rebuild_agent(&new_model, *ctx.reasoning_enabled)
+        .await;
+    *ctx.agent = Some(new_agent);
     ctx.session.model = new_model.clone();
     ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
+    ctx.session
+        .update_context_window(ctx.cfg.resolve_context_window(
+            &ctx.session.provider,
+            &new_model,
+            &crate::config::quick_models_map(ctx.cfg),
+        ));
+    if let Some((input, output)) = lookup_pricing_from_cache(&ctx.session.provider, &new_model) {
+        ctx.session.input_token_cost = input;
+        ctx.session.output_token_cost = output;
+    } else if (ctx.session.provider == "openrouter"
+        || ctx
+            .cfg
+            .custom_providers_map()
+            .contains_key(ctx.session.provider.as_str()))
+        && let Ok(prices) = crate::provider::fetch_live_model_info(
+            &ctx.session.provider,
+            ctx.cli.api_key.as_deref(),
+            &ctx.cfg.custom_providers_map(),
+            ctx.cfg.api_keys.as_ref(),
+        )
+        .await
+        && let Some(info) = prices.get(&*new_model)
+    {
+        ctx.session.input_token_cost = info.input_cost;
+        ctx.session.output_token_cost = info.output_cost;
+        if ctx.cfg.context_window.is_none()
+            && crate::config::Config::catalog_context_window(&ctx.session.provider, &new_model)
+                .is_none()
+            && let Some(cw) = info.context_length
+        {
+            ctx.session.update_context_window(cw);
+        }
+    }
     write_ok(ctx.renderer, format!("switched to model: {}", new_model));
     Ok(())
 }
@@ -230,7 +354,7 @@ async fn handle_models(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result
             if refresh {
                 // Explicit refresh: just confirm with a count overview — the picker
                 // already holds the full list, so don't dump it to the scrollback.
-                // Dim (DarkGrey), matching the "loaded AGENTS.md" startup notices.
+                // Dim (DarkGrey), matching the "[system] loaded AGENTS.md" startup notices.
                 write_result(
                     ctx.renderer,
                     format!(
@@ -472,6 +596,7 @@ async fn model_for_subagent(
     let _agent = crate::extras::subagents::builder::build_explore_agent(
         model,
         max_turns,
+        ctx.cfg,
         #[cfg(feature = "archmd")]
         None,
     )

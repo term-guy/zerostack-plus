@@ -14,6 +14,7 @@ use std::io::Write;
 use crate::ui::pickers::file::FilePicker;
 use crate::ui::pickers::list::ListPicker;
 use crate::ui::pickers::models::ModelsPicker;
+use crate::ui::pickers::rewind::{RewindOutcome, RewindPicker};
 
 const MAX_KILL_RING: usize = 30;
 
@@ -34,6 +35,7 @@ pub struct InputEditor {
     kill_ring: Vec<CompactString>,
     yank_pos: Option<usize>,
     yank_len: usize,
+    mouse_capture: bool,
 }
 
 impl InputEditor {
@@ -55,7 +57,41 @@ impl InputEditor {
             kill_ring: Vec::with_capacity(MAX_KILL_RING),
             yank_pos: None,
             yank_len: 0,
+            mouse_capture: true,
         }
+    }
+
+    /// Move the cursor to `pos` (a byte offset), clamped to a char boundary
+    /// within the buffer. Used when a mouse click places the cursor.
+    pub fn set_cursor(&mut self, pos: usize) {
+        let pos = pos.min(self.buffer.len());
+        self.cursor = if self.buffer.is_char_boundary(pos) {
+            pos
+        } else {
+            prev_char_boundary(&self.buffer, pos)
+        };
+        self.yank_pos = None;
+    }
+
+    pub fn clear_buffer(&mut self) {
+        self.buffer.clear();
+        self.cursor = 0;
+        self.history_pos = None;
+        self.draft = None;
+        self.yank_pos = None;
+    }
+
+    /// Replace the input buffer with `text`, cursor at the end. Used by the
+    /// rewind flow to drop the chosen user turn back into the box for editing.
+    pub fn load_text(&mut self, text: &str) {
+        self.buffer = CompactString::new(text);
+        // `cursor` is a byte offset into `buffer` (sliced as `buffer[..cursor]`
+        // and advanced by `len_utf8()` elsewhere), so end-of-buffer is the byte
+        // length, not the char count — they differ for multi-byte (e.g. CJK) text.
+        self.cursor = self.buffer.len();
+        self.history_pos = None;
+        self.draft = None;
+        self.yank_pos = None;
     }
 
     pub fn set_quick_model_names(&mut self, names: Vec<String>) {
@@ -79,6 +115,10 @@ impl InputEditor {
         if let Some(ref mut picker) = self.picker {
             picker.set_monochrome(monochrome);
         }
+    }
+
+    pub fn set_mouse_capture(&mut self, mouse_capture: bool) {
+        self.mouse_capture = mouse_capture;
     }
 
     pub fn set_prompt_names(&mut self, names: Vec<String>) {
@@ -134,6 +174,31 @@ impl InputEditor {
         self.picker = Some(Picker::Prefixed(picker, "/provider "));
     }
 
+    /// Open the double-Esc rewind picker over the given `(message_index,
+    /// preview)` user turns. No-op when there is nothing to rewind to.
+    pub fn start_rewind_picker(&mut self, targets: Vec<(usize, String)>) {
+        if targets.is_empty() {
+            return;
+        }
+        let mut picker = RewindPicker::new(targets);
+        picker.set_monochrome(self.monochrome);
+        picker.activate();
+        self.picker = Some(Picker::Rewind(picker));
+    }
+
+    /// Take the rewind picker's resolved outcome, if it has one. Also clears the
+    /// finished picker so the input box returns to normal.
+    pub fn take_rewind_outcome(&mut self) -> Option<RewindOutcome> {
+        let outcome = match self.picker.as_mut() {
+            Some(Picker::Rewind(p)) => p.take_outcome(),
+            _ => None,
+        };
+        if outcome.is_some() {
+            self.picker = None;
+        }
+        outcome
+    }
+
     pub fn start_prompt_picker(&mut self) {
         let mut picker = ListPicker::new();
         picker.set_monochrome(self.monochrome);
@@ -177,10 +242,12 @@ impl InputEditor {
 
         let _ = crossterm::terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::event::DisableMouseCapture,
-        );
+        if self.mouse_capture {
+            let _ = crossterm::ExecutableCommand::execute(
+                &mut stdout,
+                crossterm::event::DisableMouseCapture,
+            );
+        }
         let _ = crossterm::ExecutableCommand::execute(
             &mut stdout,
             crossterm::terminal::LeaveAlternateScreen,
@@ -202,10 +269,12 @@ impl InputEditor {
             &mut stdout,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
         );
-        let _ = crossterm::ExecutableCommand::execute(
-            &mut stdout,
-            crossterm::event::EnableMouseCapture,
-        );
+        if self.mouse_capture {
+            let _ = crossterm::ExecutableCommand::execute(
+                &mut stdout,
+                crossterm::event::EnableMouseCapture,
+            );
+        }
         let _ = crossterm::terminal::enable_raw_mode();
 
         if let Ok(content) = std::fs::read_to_string(&tmp) {

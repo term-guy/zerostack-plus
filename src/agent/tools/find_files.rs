@@ -1,20 +1,24 @@
 use ignore::WalkBuilder;
 use regex::Regex;
-use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
-    AskSender, FindFilesArgs, MAX_FIND_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
+    AskSender, FindFilesArgs, PermCheck, ToolError, check_perm, is_skip_dir,
 };
 
 pub struct FindFilesTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    pub max_results: u64,
 }
 
 impl FindFilesTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        FindFilesTool { permission, ask_tx }
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>, max_results: u64) -> Self {
+        FindFilesTool {
+            permission,
+            ask_tx,
+            max_results,
+        }
     }
 }
 
@@ -25,28 +29,33 @@ impl Tool for FindFilesTool {
     type Args = FindFilesArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "find_files".to_string(),
-            description: "Recursively find files matching a regex pattern in their filename. Respects .gitignore. Skips node_modules and target.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regex pattern to match file names against"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    }
+    fn description(&self) -> String {
+        "Recursively find files matching a regex pattern in their filename. Respects .gitignore. Skips node_modules and target.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to match file names against"
                 },
-                "required": ["pattern"]
-            }),
-        }
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in (defaults to current working directory)"
+                }
+            },
+            "required": ["pattern"]
+        })
     }
 
     async fn call(&self, args: FindFilesArgs) -> Result<String, ToolError> {
+        tracing::debug!(
+            "tool find_files start: pattern={}, path={}",
+            args.pattern,
+            args.path.as_deref().unwrap_or("."),
+        );
         let coaching =
             check_perm(&self.permission, &self.ask_tx, "find_files", &args.pattern).await?;
 
@@ -79,7 +88,7 @@ impl Tool for FindFilesTool {
             let fname = entry.file_name().to_string_lossy();
             if re.is_match(&fname) {
                 results.push(entry.path().to_string_lossy().to_string());
-                if results.len() >= MAX_FIND_RESULTS {
+                if (results.len() as u64) >= self.max_results {
                     break;
                 }
             }
@@ -96,17 +105,25 @@ impl Tool for FindFilesTool {
         results.sort();
 
         let total = results.len();
-        let result = if total >= MAX_FIND_RESULTS {
+        let max_results = self.max_results as usize;
+        let result = if total >= max_results {
             format!(
-                "{} files found (showing first {}):\n{}\n\n... and {} more",
+                "{} files found (showing first {}):\n{}\n\n[truncated after {} entries — {} more; narrow the pattern or path]",
                 total,
-                MAX_FIND_RESULTS,
-                results[..MAX_FIND_RESULTS].join("\n"),
-                total - MAX_FIND_RESULTS
+                max_results,
+                results[..max_results].join("\n"),
+                max_results,
+                total - max_results
             )
         } else {
             format!("{} files found:\n{}", total, results.join("\n"))
         };
+
+        tracing::debug!(
+            "tool find_files done: results={}, truncated={}",
+            total,
+            total >= max_results,
+        );
         Ok(match coaching {
             Some(c) => format!("{}\n\n{}", c, result),
             None => result,

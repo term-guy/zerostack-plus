@@ -1,14 +1,13 @@
 use std::path::Path;
 
 use ignore::WalkBuilder;
-use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::{
     AskSender, ListDirArgs, PermCheck, ToolError, check_perm_path, is_skip_dir,
 };
 
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
     let mut size = bytes as f64;
     let mut unit_idx = 0;
@@ -23,7 +22,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn count_dir_entries(path: &Path) -> u64 {
+pub(crate) fn count_dir_entries(path: &Path) -> u64 {
     std::fs::read_dir(path)
         .map(|rd| rd.count() as u64)
         .unwrap_or(0)
@@ -32,11 +31,22 @@ fn count_dir_entries(path: &Path) -> u64 {
 pub struct ListDirTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    /// `None` = no truncation (matches the historical behaviour).
+    /// `Some(n)` = show the first `n` entries with a recovery hint.
+    pub max_entries: Option<u64>,
 }
 
 impl ListDirTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        ListDirTool { permission, ask_tx }
+    pub fn new(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        max_entries: Option<u64>,
+    ) -> Self {
+        ListDirTool {
+            permission,
+            ask_tx,
+            max_entries,
+        }
     }
 }
 
@@ -47,25 +57,26 @@ impl Tool for ListDirTool {
     type Args = ListDirArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "list_dir".to_string(),
-            description: "List files and directories in a directory. Respects .gitignore. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path (defaults to current working directory)"
-                    }
-                },
-                "required": []
-            }),
-        }
+    fn description(&self) -> String {
+        "List files and directories in a directory. Respects .gitignore. Shows type, size, entry count for subdirectories. Sorted: directories first, then alphabetical.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path (defaults to current working directory)"
+                }
+            },
+            "required": []
+        })
     }
 
     async fn call(&self, args: ListDirArgs) -> Result<String, ToolError> {
         let path = crate::fs::expand_tilde(args.path.as_deref().unwrap_or("."));
+        tracing::debug!("tool list_dir start: path={}", path);
         let coaching = check_perm_path(&self.permission, &self.ask_tx, "list_dir", &path).await?;
 
         let walker = WalkBuilder::new(&path)
@@ -139,9 +150,16 @@ impl Tool for ListDirTool {
             });
         }
 
-        let max_name = entries.iter().map(|e| e.0.len()).max().unwrap_or(0);
+        let total_entries = entries.len();
+        let cap = self.max_entries.map(|c| c as usize);
+        let shown = cap.map(|c| total_entries.min(c)).unwrap_or(total_entries);
+        let max_name = entries[..shown]
+            .iter()
+            .map(|e| e.0.len())
+            .max()
+            .unwrap_or(0);
         let mut result = format!("Listing {}:\n", path);
-        for (name, kind, size) in &entries {
+        for (name, kind, size) in &entries[..shown] {
             let padded = format!("{:width$}", name, width = max_name);
             let size_str = if size.is_empty() {
                 String::new()
@@ -150,6 +168,20 @@ impl Tool for ListDirTool {
             };
             result.push_str(&format!("  [{}]  {}{}\n", kind, padded, size_str));
         }
+        if let Some(cap) = cap
+            && total_entries > cap
+        {
+            result.push_str(&format!(
+                "\n[truncated after {} entries — {} more; list a subdirectory or use find_files with a narrower pattern]",
+                cap,
+                total_entries - cap,
+            ));
+        }
+        tracing::debug!(
+            "tool list_dir done: path={}, entries={}",
+            path,
+            total_entries,
+        );
         if let Some(msg) = coaching {
             result = format!("{}\n\n{}", msg, result);
         }

@@ -19,4 +19,25 @@ pub mod subagents;
 #[cfg(feature = "archmd")]
 pub mod archmd;
 
+#[cfg(feature = "export")]
+pub mod export;
+
+#[cfg(feature = "advisor")]
+pub mod advisor;
+
+#[cfg(feature = "hooks")]
+pub mod hooks;
+
+pub mod chain;
+#[cfg(feature = "multimodal")]
+pub mod multimodal;
+
+pub mod status_signals;
+
+#[cfg(feature = "lsp")]
+pub mod lsp;
+
+#[cfg(feature = "rtk")]
+pub mod rtk;
+
 pub(crate) mod truncate;

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ pub enum CheckResult {
 impl CheckResult {
     pub fn allowed_with_coaching(tool: &str, _input: &str, count: usize) -> Self {
         CheckResult::AllowedWithCoaching(format!(
-            "⚡ Coaching: You've called {tool} on the same input {count} times in a row. \
+            "Coaching: You've called {tool} on the same input {count} times in a row. \
              This looks like a loop — try a different approach.",
         ))
     }
@@ -33,11 +33,21 @@ pub struct PermissionChecker {
     doom_loop_action: Action,
     working_dir: String,
     session_allowlist: Vec<(String, Pattern)>,
-    recent_calls: VecDeque<(String, String)>,
+    last_call: Option<(String, String)>,
+    consecutive_repeat_count: usize,
     mode: SecurityMode,
     user_mode: SecurityMode,
     permission_modes: Vec<SecurityMode>,
     allow_all_mcp_calls: bool,
+    /// One-shot: the next `check`/`check_path` call for this tool is forced
+    /// to `Ask`, consumed immediately after. Set by a hook `ask` verdict.
+    #[cfg(feature = "hooks")]
+    pending_forced_ask: Option<String>,
+    /// One-shot: the next `check`/`check_path` call for this tool suppresses
+    /// the prompt (`Allowed`), consumed immediately after. Set by a hook
+    /// `allow` verdict. Never bypasses a deny rule (checked first).
+    #[cfg(feature = "hooks")]
+    pending_one_shot_allow: Option<String>,
 }
 
 impl PermissionChecker {
@@ -54,7 +64,7 @@ impl PermissionChecker {
             ("grep", &config.grep),
             ("find_files", &config.find_files),
             ("list_dir", &config.list_dir),
-            ("write_todo_list", &config.write_todo_list),
+            ("todo_write", &config.todo_write),
             ("mcp_tool", &config.mcp_tool),
         ] {
             let Some(tp) = tool_perm else { continue };
@@ -170,6 +180,7 @@ impl PermissionChecker {
                 .filter_map(|s| match s.as_str() {
                     "restrictive" => Some(SecurityMode::Restrictive),
                     "readonly" => Some(SecurityMode::ReadOnly),
+                    "planwrite" => Some(SecurityMode::PlanWrite),
                     "guarded" => Some(SecurityMode::Guarded),
                     "standard" => Some(SecurityMode::Standard),
                     "yolo" => Some(SecurityMode::Yolo),
@@ -185,12 +196,33 @@ impl PermissionChecker {
             doom_loop_action,
             working_dir,
             session_allowlist: Vec::new(),
-            recent_calls: VecDeque::with_capacity(16),
+            last_call: None,
+            consecutive_repeat_count: 0,
             mode,
             user_mode: mode,
             permission_modes: resolved_modes,
             allow_all_mcp_calls: false,
+            #[cfg(feature = "hooks")]
+            pending_forced_ask: None,
+            #[cfg(feature = "hooks")]
+            pending_one_shot_allow: None,
         }
+    }
+
+    /// Forces the next `check`/`check_path` call for `tool` to `Ask`,
+    /// regardless of permission mode. Consumed after that one call. Set by a
+    /// hook `ask` verdict; never overrides a deny rule (checked first).
+    #[cfg(feature = "hooks")]
+    pub fn force_ask_once(&mut self, tool: String) {
+        self.pending_forced_ask = Some(tool);
+    }
+
+    /// Suppresses the interactive prompt for the next `check`/`check_path`
+    /// call for `tool`. Consumed after that one call. Set by a hook `allow`
+    /// verdict; never overrides a deny rule (checked first).
+    #[cfg(feature = "hooks")]
+    pub fn allow_once(&mut self, tool: String) {
+        self.pending_one_shot_allow = Some(tool);
     }
 
     fn apply_rules(&self) -> bool {
@@ -198,14 +230,14 @@ impl PermissionChecker {
     }
 
     fn is_read_tool(&self, tool: &str) -> bool {
-        matches!(tool, "read" | "grep" | "find_files" | "list_dir")
+        matches!(tool, "read" | "grep" | "find_files" | "list_dir" | "task")
     }
 
     fn resolve_check_action(&self, tool: &str, matched: &SmallVec<[Action; 4]>) -> Action {
         let base = matched.last().copied();
         match self.mode {
             SecurityMode::Restrictive => base.unwrap_or(Action::Ask),
-            SecurityMode::ReadOnly => base.unwrap_or_else(|| {
+            SecurityMode::ReadOnly | SecurityMode::PlanWrite => base.unwrap_or_else(|| {
                 if self.is_read_tool(tool) {
                     Action::Allow
                 } else {
@@ -244,6 +276,15 @@ impl PermissionChecker {
                     Action::Deny
                 }
             }),
+            SecurityMode::PlanWrite => base.unwrap_or_else(|| {
+                if self.is_read_tool(tool)
+                    || (matches!(tool, "write" | "edit") && is_plan_file(abs_path))
+                {
+                    Action::Allow
+                } else {
+                    Action::Deny
+                }
+            }),
             SecurityMode::Guarded => base.unwrap_or_else(|| {
                 if self.is_read_tool(tool) {
                     Action::Allow
@@ -276,18 +317,22 @@ impl PermissionChecker {
     fn doom_loop_check(&mut self, tool: &str, doom_key: &str, action: Action) -> CheckResult {
         if action != Action::Deny {
             self.track_doom_loop(tool, doom_key);
-            if self.is_doom_loop(tool, doom_key) {
+            if self.is_doom_loop() {
                 if action == Action::Allow {
-                    let count = self.count_doom_loop(tool, doom_key);
+                    let count = self.count_doom_loop();
                     return CheckResult::allowed_with_coaching(tool, doom_key, count);
                 }
                 match self.doom_loop_action {
                     Action::Deny => {
+                        tracing::info!("perm doom-loop blocked: tool={}", tool);
                         return CheckResult::Denied(
                             "Doom loop: repeated identical tool call".to_string(),
                         );
                     }
-                    Action::Ask => return CheckResult::Ask,
+                    Action::Ask => {
+                        tracing::info!("perm doom-loop ask: tool={}", tool);
+                        return CheckResult::Ask;
+                    }
                     Action::Allow => {}
                 }
             }
@@ -299,14 +344,46 @@ impl PermissionChecker {
         }
     }
 
+    /// Consumes a hook-set one-shot forced-ask/allow entry for `tool`, if
+    /// pending. Called after the deny-rule check in `check`/`check_path` so
+    /// neither can ever bypass a deny.
+    #[cfg(feature = "hooks")]
+    fn take_pending_one_shot(&mut self, tool: &str) -> Option<CheckResult> {
+        if self.pending_forced_ask.as_deref() == Some(tool) {
+            self.pending_forced_ask = None;
+            return Some(CheckResult::Ask);
+        }
+        if self.pending_one_shot_allow.as_deref() == Some(tool) {
+            self.pending_one_shot_allow = None;
+            return Some(CheckResult::Allowed);
+        }
+        None
+    }
+
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
-        if tool == "write_todo_list" {
+        tracing::debug!("perm check: tool={}, input_len={}", tool, input.len());
+        if tool == "todo_write" {
             return CheckResult::Allowed;
+        }
+        // Deny rules are the security baseline — evaluate before the session
+        // allowlist and allow_all_mcp_calls so neither can bypass a deny.
+        if self.matches_deny_rule(tool, &[input]) {
+            return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        #[cfg(feature = "hooks")]
+        if let Some(result) = self.take_pending_one_shot(tool) {
+            return result;
         }
         if self.allow_all_mcp_calls && tool == "mcp_tool" {
             return CheckResult::Allowed;
         }
         if self.is_session_allowed(tool, input) {
+            return CheckResult::Allowed;
+        }
+        if tool == "mcp_tool"
+            && matches!(self.mode, SecurityMode::ReadOnly | SecurityMode::PlanWrite)
+            && is_read_equivalent_mcp(input)
+        {
             return CheckResult::Allowed;
         }
 
@@ -326,13 +403,22 @@ impl PermissionChecker {
     }
 
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
-        if tool == "write_todo_list" {
+        tracing::debug!("perm check path: tool={}, path={}", tool, path);
+        if tool == "todo_write" {
             return CheckResult::Allowed;
         }
 
         let expanded = crate::fs::expand_tilde(path);
         let abs_path = resolve_absolute(&expanded, &self.working_dir);
 
+        // Deny rules first — security baseline, cannot be bypassed.
+        if self.matches_deny_rule(tool, &[&abs_path, &expanded]) {
+            return CheckResult::Denied("Blocked by deny rule".to_string());
+        }
+        #[cfg(feature = "hooks")]
+        if let Some(result) = self.take_pending_one_shot(tool) {
+            return result;
+        }
         if self.is_session_allowed(tool, &expanded) || self.is_session_allowed(tool, &abs_path) {
             return CheckResult::Allowed;
         }
@@ -350,6 +436,23 @@ impl PermissionChecker {
 
         let action = self.resolve_path_action(tool, &matched, &abs_path);
         self.doom_loop_check(tool, &expanded, action)
+    }
+
+    /// Check whether any deny rule matches the given inputs. Deny rules are
+    /// the security baseline and must be evaluated before the session
+    /// allowlist to prevent `AllowAlways` from bypassing them.
+    fn matches_deny_rule(&self, tool: &str, inputs: &[&str]) -> bool {
+        if !self.apply_rules() {
+            return false;
+        }
+        if let Some(rules) = self.rules.get(tool) {
+            for (pattern, action) in rules {
+                if *action == Action::Deny && inputs.iter().any(|inp| pattern.matches(inp)) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
@@ -389,6 +492,7 @@ impl PermissionChecker {
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
+        tracing::debug!("perm mode changed: {:?} -> {:?}", self.mode, mode);
         self.mode = mode;
         self.user_mode = mode;
     }
@@ -405,6 +509,7 @@ impl PermissionChecker {
         self.mode
     }
 
+    #[cfg(feature = "mcp")]
     pub fn set_allow_all_mcp_calls(&mut self, allow: bool) {
         self.allow_all_mcp_calls = allow;
     }
@@ -421,8 +526,11 @@ impl PermissionChecker {
             Path::new(&self.working_dir).join(p)
         };
         let cwd = Path::new(&self.working_dir);
-        let normalized = normalize_path(&p);
-        let normalized_cwd = normalize_path(cwd);
+        // Canonicalize to resolve symlinks before checking. If canonicalization
+        // fails (e.g. path doesn't exist yet), fall back to syntactic normalize
+        // so we still catch `..` traversal.
+        let normalized = p.canonicalize().unwrap_or_else(|_| normalize_path(&p));
+        let normalized_cwd = cwd.canonicalize().unwrap_or_else(|_| normalize_path(cwd));
         !normalized.starts_with(&normalized_cwd)
     }
 
@@ -435,23 +543,33 @@ impl PermissionChecker {
         None
     }
 
+    /// Feeds a hook-denied call into doom-loop detection. A hook deny never
+    /// reaches `check`/`check_path`, so without this a denied call could
+    /// retry forever invisibly to doom detection.
+    #[cfg(feature = "hooks")]
+    pub fn record_blocked(&mut self, tool: &str, input: &str) {
+        self.track_doom_loop(tool, input);
+    }
+
     fn track_doom_loop(&mut self, tool: &str, input: &str) {
-        self.recent_calls
-            .push_back((tool.to_string(), input.to_string()));
-        if self.recent_calls.len() > 16 {
-            self.recent_calls.pop_front();
+        let current = (tool.to_string(), input.to_string());
+        match &self.last_call {
+            Some(prev) if *prev == current => {
+                self.consecutive_repeat_count += 1;
+            }
+            _ => {
+                self.last_call = Some(current);
+                self.consecutive_repeat_count = 1;
+            }
         }
     }
 
-    fn is_doom_loop(&self, tool: &str, input: &str) -> bool {
-        self.count_doom_loop(tool, input) >= 3
+    fn is_doom_loop(&self) -> bool {
+        self.consecutive_repeat_count >= 3
     }
 
-    fn count_doom_loop(&self, tool: &str, input: &str) -> usize {
-        self.recent_calls
-            .iter()
-            .filter(|(t, i)| t == tool && i == input)
-            .count()
+    fn count_doom_loop(&self) -> usize {
+        self.consecutive_repeat_count
     }
 }
 
@@ -479,4 +597,18 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     result
+}
+
+fn is_plan_file(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.starts_with("PLAN") && name.ends_with(".md"))
+}
+
+fn is_read_equivalent_mcp(input: &str) -> bool {
+    let lower = input.to_lowercase();
+    lower.starts_with("mcp_tool:exa web search:")
+        || lower.starts_with("mcp_tool:context7:")
+        || lower.starts_with("mcp_tool:grep.app:")
 }

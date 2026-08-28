@@ -1,23 +1,25 @@
 use ignore::WalkBuilder;
 use regex::Regex;
-use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
-use crate::agent::tools::{
-    AskSender, GrepArgs, MAX_GREP_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
-};
+use crate::agent::tools::{AskSender, GrepArgs, PermCheck, ToolError, check_perm, is_skip_dir};
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    pub max_results: u64,
 }
 
 impl GrepTool {
-    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        GrepTool { permission, ask_tx }
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>, max_results: u64) -> Self {
+        GrepTool {
+            permission,
+            ask_tx,
+            max_results,
+        }
     }
 
-    fn glob_to_regex(glob: &str) -> String {
+    pub(crate) fn glob_to_regex(glob: &str) -> String {
         let mut re = String::with_capacity(glob.len() * 2);
         for c in glob.chars() {
             match c {
@@ -33,7 +35,7 @@ impl GrepTool {
         re
     }
 
-    fn is_binary(data: &[u8]) -> bool {
+    pub(crate) fn is_binary(data: &[u8]) -> bool {
         data.iter().take(8192).any(|&b| b == 0)
     }
 }
@@ -45,36 +47,42 @@ impl Tool for GrepTool {
     type Args = GrepArgs;
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        ToolDefinition {
-            name: "grep".to_string(),
-            description: "Search file contents using a regex pattern (Rust regex syntax). Respects .gitignore. Skips binary files, node_modules, and target.".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regex pattern to search for (supports Rust regex syntax)"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    },
-                    "include": {
-                        "type": "string",
-                        "description": "Optional file glob pattern to filter (e.g. '*.rs', '*.{ts,tsx}')"
-                    },
-                    "context_lines": {
-                        "type": "integer",
-                        "description": "Number of context lines to show before and after each match (like grep -C)"
-                    }
+    fn description(&self) -> String {
+        "Search file contents using a regex pattern (Rust regex syntax). Respects .gitignore. Skips binary files, node_modules, and target.".to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for (supports Rust regex syntax)"
                 },
-                "required": ["pattern"]
-            }),
-        }
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search in (defaults to current working directory)"
+                },
+                "include": {
+                    "type": "string",
+                    "description": "Optional file glob pattern to filter (e.g. '*.rs', '*.{ts,tsx}')"
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of context lines to show before and after each match (like grep -C)"
+                }
+            },
+            "required": ["pattern"]
+        })
     }
 
     async fn call(&self, args: GrepArgs) -> Result<String, ToolError> {
+        tracing::debug!(
+            "tool grep start: pattern={}, path={}, include={:?}",
+            args.pattern,
+            args.path.as_deref().unwrap_or("."),
+            args.include,
+        );
         let coaching = check_perm(&self.permission, &self.ask_tx, "grep", &args.pattern).await?;
 
         let re = Regex::new(&args.pattern)
@@ -103,14 +111,16 @@ impl Tool for GrepTool {
             })
             .build();
 
+        let max_results = self.max_results as usize;
         let mut file_count = 0;
-        let mut all_results: Vec<String> = Vec::with_capacity(MAX_GREP_RESULTS.min(64));
+        let mut files_with_matches: usize = 0;
+        let mut all_results: Vec<String> = Vec::with_capacity(max_results.min(64));
 
         for entry in walker
             .flatten()
             .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         {
-            if all_results.len() >= MAX_GREP_RESULTS {
+            if all_results.len() >= max_results {
                 break;
             }
 
@@ -149,11 +159,12 @@ impl Tool for GrepTool {
                     if match_lines.is_empty() {
                         continue;
                     }
+                    files_with_matches += 1;
 
                     if context == 0 {
                         for &ml in &match_lines {
                             all_results.push(format!("{}:{}:{}", path_str, ml + 1, lines[ml]));
-                            if all_results.len() >= MAX_GREP_RESULTS {
+                            if all_results.len() >= max_results {
                                 break;
                             }
                         }
@@ -168,7 +179,7 @@ impl Tool for GrepTool {
                         }
 
                         let mut i = 0;
-                        while i < total && all_results.len() < MAX_GREP_RESULTS {
+                        while i < total && all_results.len() < max_results {
                             if !shown[i] {
                                 i += 1;
                                 continue;
@@ -178,7 +189,7 @@ impl Tool for GrepTool {
                                 all_results.push("--".to_string());
                             }
 
-                            while i < total && shown[i] && all_results.len() < MAX_GREP_RESULTS {
+                            while i < total && shown[i] && all_results.len() < max_results {
                                 let is_match = match_lines.binary_search(&i).is_ok();
                                 let sep = if is_match { ':' } else { '-' };
                                 all_results.push(format!(
@@ -206,14 +217,16 @@ impl Tool for GrepTool {
         }
 
         let total = all_results.len();
-        let result = if total >= MAX_GREP_RESULTS {
+        let truncated = total >= max_results;
+        let result = if truncated {
             format!(
-                "{} results (showing first {}, searched {} files):\n{}\n\n... and {} more matches",
+                "{} results (showing first {}, searched {} files):\n{}\n\n[truncated after {} matches — {} more matches; narrow the pattern or restrict to a path]",
                 total,
-                MAX_GREP_RESULTS,
+                max_results,
                 file_count,
                 all_results.join("\n"),
-                total - MAX_GREP_RESULTS
+                max_results,
+                total - max_results
             )
         } else {
             format!(
@@ -223,6 +236,29 @@ impl Tool for GrepTool {
                 all_results.join("\n")
             )
         };
+
+        // Add a "consider task" hint when results span multiple files and the
+        // count is non-trivial. The agent sees this at the moment it decides
+        // its next action, which is the highest-leverage point in the loop.
+        // Suppressed when truncated, since the truncation hint already steers
+        // the agent toward narrowing or task.
+        let result = if !truncated && total >= 10 && files_with_matches >= 2 {
+            format!(
+                "{}\n\n[{} matches across {} files; for cross-file enumeration or synthesis, `task` returns a verified summary in one call]",
+                result, total, files_with_matches,
+            )
+        } else {
+            result
+        };
+
+        tracing::debug!(
+            "tool grep done: files_searched={}, files_with_matches={}, total_matches={}, truncated={}",
+            file_count,
+            files_with_matches,
+            total,
+            truncated,
+        );
+
         Ok(match coaching {
             Some(c) => format!("{}\n\n{}", c, result),
             None => result,

@@ -1,4 +1,4 @@
-use crate::ui::pickers::file::FilePicker;
+use crate::ui::pickers::file::{FilePicker, walk_files, walk_files_streaming};
 use crate::ui::pickers::list::ListPicker;
 use crate::ui::pickers::models::ModelsPicker;
 use std::path::PathBuf;
@@ -297,4 +297,216 @@ fn test_static_commands_prepopulated() {
     picker.char_input('o');
     picker.char_input('d');
     assert!(picker.matches.contains(&"/model".to_string()));
+}
+
+// ── walk_files tests ────────────────────────────────────────────────
+
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn with_temp_dir<F>(f: F)
+where
+    F: FnOnce(&Path),
+{
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("zerostack_test_{}_{}", std::process::id(), n));
+    fs::create_dir_all(&dir).unwrap();
+    let canonical = dir.canonicalize().unwrap();
+    f(&canonical);
+    let _ = fs::remove_dir_all(&canonical);
+}
+
+#[test]
+fn test_walk_files_includes_directories() {
+    with_temp_dir(|root| {
+        fs::create_dir(root.join("subdir")).unwrap();
+        fs::write(root.join("file.txt"), b"hello").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
+
+        assert!(
+            names.contains(&"file.txt"),
+            "walk_files should include files"
+        );
+        assert!(
+            names.contains(&"subdir"),
+            "walk_files should include directories, got: {:?}",
+            names
+        );
+    });
+}
+
+#[test]
+fn test_walk_files_includes_nested_dirs() {
+    with_temp_dir(|root| {
+        fs::create_dir_all(root.join("a").join("b")).unwrap();
+        fs::write(root.join("a").join("b").join("deep.txt"), b"deep").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
+
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"a/b"));
+        assert!(names.contains(&"a/b/deep.txt"));
+    });
+}
+
+#[test]
+fn test_walk_files_skips_dotfiles() {
+    with_temp_dir(|root| {
+        fs::write(root.join(".hidden"), b"secret").unwrap();
+        fs::write(root.join("visible.txt"), b"hello").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
+
+        assert!(!names.contains(&".hidden"));
+        assert!(names.contains(&"visible.txt"));
+    });
+}
+
+#[test]
+fn test_walk_files_skips_files_in_dot_dirs() {
+    with_temp_dir(|root| {
+        fs::create_dir_all(root.join(".secret").join("nested")).unwrap();
+        fs::write(
+            root.join(".secret").join("nested").join("file.txt"),
+            b"hidden",
+        )
+        .unwrap();
+        fs::write(root.join(".secret").join("secret_file.txt"), b"hidden").unwrap();
+        fs::write(root.join("public.txt"), b"visible").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
+
+        assert!(!names.contains(&".secret"));
+        assert!(!names.contains(&".secret/nested"));
+        assert!(!names.contains(&".secret/nested/file.txt"));
+        assert!(!names.contains(&".secret/secret_file.txt"));
+        assert!(names.contains(&"public.txt"));
+    });
+}
+
+#[test]
+fn test_walk_files_root_is_sorted_and_stripped() {
+    with_temp_dir(|root| {
+        fs::write(root.join("z.txt"), b"z").unwrap();
+        fs::write(root.join("c.txt"), b"c").unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
+
+        let root_idx = names.iter().position(|n| n.is_empty());
+        assert!(
+            root_idx.is_some(),
+            "root entry (empty string) should be present"
+        );
+
+        let file_indices: Vec<usize> = names
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.ends_with(".txt"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            file_indices.windows(2).all(|w| w[0] < w[1]),
+            "files should be sorted"
+        );
+    });
+}
+
+#[test]
+fn test_walk_files_empty_directory() {
+    with_temp_dir(|root| {
+        let files = walk_files(&root.to_string_lossy());
+        let names: Vec<&str> = files.iter().map(|p| p.to_str().unwrap()).collect();
+
+        assert_eq!(names.len(), 1, "only root entry expected in empty dir");
+        assert!(names.contains(&""), "root entry should be present");
+    });
+}
+
+// ── walk_files_streaming tests ───────────────────────────────────────
+
+#[test]
+fn test_walk_files_streaming_batches_match_walk_files() {
+    with_temp_dir(|root| {
+        for i in 0..30 {
+            fs::write(root.join(format!("file{:02}.txt", i)), b"x").unwrap();
+        }
+
+        let mut batches: Vec<Vec<std::path::PathBuf>> = Vec::new();
+        walk_files_streaming(
+            &root.to_string_lossy(),
+            &std::sync::atomic::AtomicBool::new(false),
+            |batch| {
+                batches.push(batch);
+                true
+            },
+        );
+
+        assert!(
+            batches.len() > 1,
+            "31 entries should arrive in multiple batches"
+        );
+        assert!(batches.iter().all(|b| b.len() <= 25));
+
+        let streamed: Vec<&std::path::PathBuf> = batches.iter().flatten().collect();
+        let full = walk_files(&root.to_string_lossy());
+        assert_eq!(
+            streamed,
+            full.iter().collect::<Vec<_>>(),
+            "streamed batches should equal the full walk, in order"
+        );
+    });
+}
+
+#[test]
+fn test_walk_files_streaming_cancel_stops_immediately() {
+    with_temp_dir(|root| {
+        for i in 0..10 {
+            fs::write(root.join(format!("file{}.txt", i)), b"x").unwrap();
+        }
+
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut files = Vec::new();
+        walk_files_streaming(&root.to_string_lossy(), &cancel, |batch| {
+            files.extend(batch);
+            true
+        });
+        assert!(
+            files.is_empty(),
+            "a pre-set cancel flag should prevent any results"
+        );
+    });
+}
+
+#[test]
+fn test_walk_files_streaming_emit_false_stops_early() {
+    with_temp_dir(|root| {
+        for i in 0..60 {
+            fs::write(root.join(format!("file{:02}.txt", i)), b"x").unwrap();
+        }
+
+        let mut files = Vec::new();
+        walk_files_streaming(
+            &root.to_string_lossy(),
+            &std::sync::atomic::AtomicBool::new(false),
+            |batch| {
+                files.extend(batch);
+                false // refuse every batch: stop after the first one
+            },
+        );
+        assert!(
+            files.len() <= 25,
+            "refusing the first batch should stop the walk, got {} files",
+            files.len()
+        );
+    });
 }

@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use futures::future::join_all;
-use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
 
@@ -45,32 +44,32 @@ impl Tool for TaskTool {
     type Args = TaskArgs;
     type Output = String;
 
-    async fn definition(&self, _p: String) -> ToolDefinition {
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Delegate a MULTI-STEP read-only investigation to a subagent. \
-Use ONLY when answering a question requires searching several files, cross-referencing, \
-and synthesizing findings (e.g. \"Where is MCP support implemented?\", \
-\"What does the function get_signature do?\"). \
-Do NOT use for single-step operations: listing a directory, grepping for one pattern, \
-reading a known file — just call the tool directly. \
-Do NOT use for wide/vague tasks (e.g. \"check all documentation\", \"explore the codebase\"). \
+    fn description(&self) -> String {
+        "Search and investigate the codebase via a fresh-context subagent. \
+Use for any cross-file question: where is X used, how does Y work, \
+find/list/count all X across the codebase, what calls Z, audit Q. \
+The subagent reads, greps, finds files, lists directories, accesses memory, \
+and returns a verified summary. \
+More reliable than running multiple grep/read calls yourself; the subagent \
+enumerates completely without truncation gaps or synthesis errors across partial views. \
 Multiple prompts run in parallel. \
-The subagent can read, grep, find_files, list directories, and access memory. \
-Returns a summary of findings."
-                .to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "prompts": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Investigation prompts requiring multiple tool calls to answer (parallel when multiple). NOT for single-step operations like listing a directory or reading one file."
-                    }
-                },
-                "required": ["prompts"]
-            }),
-        }
+Skip only for known-location work: reading one identified file, \
+editing in a known location, grepping for a literal you will act on immediately."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "prompts": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Investigation prompt for the subagent. Use one for a focused question, or multiple to run independent investigations in parallel. Examples: 'List all tests in this project', 'Where is config loaded?', 'How does the agent loop work?'"
+                }
+            },
+            "required": ["prompts"]
+        })
     }
 
     async fn call(&self, args: TaskArgs) -> Result<String, ToolError> {
@@ -86,8 +85,14 @@ Returns a summary of findings."
         )
         .await?;
 
-        let (client, model_name, max_turns) =
-            with_config(|cfg| (cfg.client.clone(), cfg.model_name.clone(), cfg.max_turns));
+        let (client, model_name, max_turns, config) = with_config(|cfg| {
+            (
+                cfg.client.clone(),
+                cfg.model_name.clone(),
+                cfg.max_turns,
+                cfg.config.clone(),
+            )
+        });
 
         let subagent_event_tx = clone_subagent_event_tx();
 
@@ -107,14 +112,43 @@ Returns a summary of findings."
             let model = client.completion_model(model_name.clone());
             let event_tx = subagent_event_tx.clone();
             let architecture = architecture.clone();
+            let config = config.clone();
             let join_handle = tokio::spawn(async move {
-                let work = async {
-                    let agent = builder::build_explore_agent(model, max_turns, architecture).await;
-                    agent
-                        .run_subagent(&prompt_text, max_turns, event_tx.as_ref())
-                        .await
-                };
-                match tokio::time::timeout(SUBAGENT_TIMEOUT, work).await {
+                #[cfg(feature = "hooks")]
+                let prompt_text =
+                    match crate::extras::hooks::dispatch_subagent_start("explore").await {
+                        Some(extra) => format!("{extra}\n\n{prompt_text}"),
+                        None => prompt_text,
+                    };
+                let agent =
+                    builder::build_explore_agent(model, max_turns, &config, architecture).await;
+                let result = tokio::time::timeout(
+                    SUBAGENT_TIMEOUT,
+                    agent.run_subagent(&prompt_text, max_turns, event_tx.as_ref(), &config.retry),
+                )
+                .await;
+                #[cfg(feature = "hooks")]
+                if let Ok(Ok(response)) = &result
+                    && let crate::extras::hooks::SubagentStopGate::Continue { reason } =
+                        crate::extras::hooks::dispatch_subagent_stop("explore", false).await
+                {
+                    tracing::info!("hooks: SubagentStop forced continuation: {reason}");
+                    let continuation = format!("{response}\n\n{reason}");
+                    let retried = tokio::time::timeout(
+                        SUBAGENT_TIMEOUT,
+                        agent.run_subagent(
+                            &continuation,
+                            max_turns,
+                            event_tx.as_ref(),
+                            &config.retry,
+                        ),
+                    )
+                    .await;
+                    if let Ok(Ok(retried)) = retried {
+                        return (i, prompt_text, Ok(retried));
+                    }
+                }
+                match result {
                     Ok(Ok(response)) => (i, prompt_text, Ok(response)),
                     Ok(Err(e)) => (i, prompt_text, Err(format!("[error: {}]", e))),
                     Err(_elapsed) => (

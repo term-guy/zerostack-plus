@@ -31,7 +31,8 @@ pub struct PermissionConfig {
     pub grep: Option<ToolPerm>,
     pub find_files: Option<ToolPerm>,
     pub list_dir: Option<ToolPerm>,
-    pub write_todo_list: Option<ToolPerm>,
+    #[serde(alias = "write_todo_list")]
+    pub todo_write: Option<ToolPerm>,
     pub mcp_tool: Option<ToolPerm>,
     pub external_directory: Option<HashMap<String, Action>>,
     pub doom_loop: Option<Action>,
@@ -63,6 +64,7 @@ pub enum SecurityMode {
     Standard,
     Restrictive,
     ReadOnly,
+    PlanWrite,
     Guarded,
     Yolo,
 }
@@ -73,6 +75,7 @@ impl SecurityMode {
             "standard" => Some(SecurityMode::Standard),
             "restrictive" => Some(SecurityMode::Restrictive),
             "readonly" => Some(SecurityMode::ReadOnly),
+            "planwrite" => Some(SecurityMode::PlanWrite),
             "guarded" => Some(SecurityMode::Guarded),
             "yolo" => Some(SecurityMode::Yolo),
             _ => None,
@@ -86,6 +89,7 @@ impl std::fmt::Display for SecurityMode {
             SecurityMode::Standard => write!(f, "standard"),
             SecurityMode::Restrictive => write!(f, "restrictive"),
             SecurityMode::ReadOnly => write!(f, "readonly"),
+            SecurityMode::PlanWrite => write!(f, "planwrite"),
             SecurityMode::Guarded => write!(f, "guarded"),
             SecurityMode::Yolo => write!(f, "yolo"),
         }
@@ -115,6 +119,24 @@ pub fn parse_prompt_mode(content: &str) -> (Option<&str>, &str) {
     } else {
         (None, content)
     }
+}
+
+/// Resolve the security mode requested by prompt `name`'s `%%mode=`
+/// directive, reading the raw (unstripped) prompt content from `prompts`.
+/// Returns `None` when the prompt is unknown, has no directive, names an
+/// unknown mode, or uses `last_user_mode` (meaningless at startup: the
+/// current mode already is the user's mode).
+pub fn resolve_startup_prompt_mode(
+    prompts: &HashMap<String, String>,
+    name: &str,
+) -> Option<SecurityMode> {
+    let content = prompts.get(name)?;
+    let (mode_directive, _) = parse_prompt_mode(content);
+    let mode_str = mode_directive?;
+    if mode_str == "last_user_mode" {
+        return None;
+    }
+    SecurityMode::from_str(mode_str)
 }
 
 /// Auto-deny regex patterns that are always active regardless of config.

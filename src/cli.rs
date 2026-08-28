@@ -4,7 +4,7 @@ use compact_str::CompactString;
 use crate::config;
 use crate::config::types::EditSystem;
 
-#[derive(Parser, Debug, Default)]
+#[derive(Parser, Debug, Default, Clone)]
 #[command(name = "zerostack", version, about = "Minimal coding agent")]
 pub struct Cli {
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
@@ -22,6 +22,12 @@ pub struct Cli {
     #[arg(long = "print-config", help = "Print resolved configuration and exit")]
     pub print_config: bool,
 
+    #[arg(long = "setup", help = "Interactive setup wizard")]
+    pub setup: bool,
+
+    #[arg(long = "tutor", help = "Show getting started guide")]
+    pub tutor: bool,
+
     #[arg(short = 'c', long = "continue", help = "Continue most recent session")]
     pub continue_session: bool,
 
@@ -30,6 +36,9 @@ pub struct Cli {
 
     #[arg(long = "session", help = "Load session by ID prefix")]
     pub session: Option<String>,
+
+    #[arg(long = "name", help = "Name for the session")]
+    pub name: Option<String>,
 
     #[arg(long = "no-session", help = "Ephemeral mode, do not save")]
     pub no_session: bool,
@@ -58,7 +67,12 @@ pub struct Cli {
     #[arg(long = "temperature", help = "Model temperature (0.0 to 2.0)")]
     pub temperature: Option<f64>,
 
-    #[arg(short = 't', long = "tools", help = "Allowlist specific tools")]
+    #[arg(
+        short = 't',
+        long = "tools",
+        value_delimiter = ',',
+        help = "Allowlist specific tools"
+    )]
     pub tools: Vec<String>,
 
     #[arg(long = "no-tools", help = "Disable all tools")]
@@ -66,6 +80,25 @@ pub struct Cli {
 
     #[arg(long = "no-color", help = "Disable colored TUI output")]
     pub no_color: bool,
+
+    #[cfg(feature = "hooks")]
+    #[arg(long = "no-hooks", help = "Disable all hooks")]
+    pub no_hooks: bool,
+
+    #[cfg(feature = "hooks")]
+    #[arg(
+        long = "hooks-test",
+        value_name = "TOOL",
+        help = "Dry-run PreToolUse hooks for TOOL with --hooks-test-input, print the merged decision, and exit"
+    )]
+    pub hooks_test: Option<String>,
+
+    #[cfg(feature = "hooks")]
+    #[arg(
+        long = "hooks-test-input",
+        help = "tool_input JSON for --hooks-test (default: {})"
+    )]
+    pub hooks_test_input: Option<String>,
 
     #[arg(long = "restrictive", short = 'R', help = "Ask for all operations")]
     pub restrictive: bool,
@@ -105,6 +138,28 @@ pub struct Cli {
         help = "Sandbox backend: bwrap (default) or zerobox"
     )]
     pub sandbox_backend: Option<String>,
+
+    #[arg(
+        long = "sandbox-required",
+        help = "Refuse to run bash commands when the sandbox backend is unavailable (implies --sandbox)"
+    )]
+    pub sandbox_required: bool,
+
+    #[arg(
+        long = "sandbox-expose",
+        action = clap::ArgAction::Append,
+        help = "Restore read-only access to a masked credential path or subpath (repeatable)"
+    )]
+    pub sandbox_expose: Vec<String>,
+
+    #[arg(
+        long = "sandbox-network",
+        help = "Allow sandboxed bash commands to use the network. Bare flag or `=true` enables it (the default); use --sandbox-network=false to disable",
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true
+    )]
+    pub sandbox_network: Option<bool>,
 
     #[arg(
         long = "shell",
@@ -195,6 +250,69 @@ pub struct Cli {
     )]
     pub wt_force: bool,
 
+    #[cfg(feature = "advisor")]
+    #[arg(
+        long = "advisor",
+        help = "Enable advisor tool (model can consult a stronger reviewer model)"
+    )]
+    pub advisor: bool,
+
+    #[cfg(feature = "advisor")]
+    #[arg(
+        long = "advisor-model",
+        help = "Advisor model name (e.g. 'claude-opus-4-8')"
+    )]
+    pub advisor_model: Option<String>,
+
+    #[cfg(feature = "advisor")]
+    #[arg(
+        long = "advisor-max-uses",
+        help = "Maximum advisor calls per request (default: 3)"
+    )]
+    pub advisor_max_uses: Option<usize>,
+
+    #[cfg(feature = "advisor")]
+    #[arg(
+        long = "advisor-human-handoff",
+        help = "Route advisor calls to the user instead of a model",
+        default_missing_value = "true",
+        num_args = 0..=1,
+        require_equals = true,
+        default_value = "false"
+    )]
+    pub advisor_human_handoff: Option<bool>,
+
+    #[cfg(feature = "advisor")]
+    #[arg(
+        long = "advisor-kilobytes-limit",
+        help = "Max total kilobytes of conversation context to send to the advisor (head: half, tail: half). Default: 256",
+        default_value = "256"
+    )]
+    pub advisor_kilobytes_limit: u32,
+
+    #[cfg(feature = "status-signals")]
+    #[arg(
+        long = "status-socket",
+        help = "Unix socket path for status signals (start/stop messages)"
+    )]
+    pub status_socket: Option<String>,
+
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::SetTrue,
+          help = "Enable full logging (trace level) to a timestamped log file under the data directory")]
+    pub verbose: bool,
+
+    #[arg(
+        long = "log-file",
+        help = "Write logs to this file (overrides verbose default path)"
+    )]
+    pub log_file: Option<std::path::PathBuf>,
+
+    #[arg(
+        long = "log-level",
+        help = "Set stderr log level (trace, debug, info, warn, error)"
+    )]
+    pub log_level: Option<String>,
+
     #[arg(help = "Prompt message(s)")]
     pub message: Vec<String>,
 }
@@ -209,7 +327,16 @@ impl Cli {
     }
 
     pub fn resolve_model(&self, cfg: &config::Config) -> CompactString {
-        if let Some(m) = self.model.as_deref().or(cfg.model.as_deref()) {
+        // CLI --model takes a raw model string.
+        if let Some(m) = self.model.as_deref() {
+            return CompactString::new(m);
+        }
+        // Config model field references a quick model name; resolve it.
+        if let Some(m) = cfg.model.as_deref() {
+            let qm = config::quick_models_map(cfg);
+            if let Some(q) = qm.get(m) {
+                return q.model.clone();
+            }
             return CompactString::new(m);
         }
         // No explicit model. If a provider was chosen explicitly, default to a
@@ -257,7 +384,19 @@ impl Cli {
     }
 
     pub fn resolve_sandbox(&self, cfg: &config::Config) -> bool {
-        self.sandbox || cfg.sandbox.unwrap_or(false)
+        // sandbox-required implies the sandbox, even when sandbox was turned
+        // off explicitly: the guarantee wins over the contradicting setting.
+        self.sandbox || cfg.sandbox.unwrap_or(false) || self.resolve_sandbox_required(cfg)
+    }
+
+    pub fn resolve_sandbox_required(&self, cfg: &config::Config) -> bool {
+        self.sandbox_required || cfg.sandbox_required.unwrap_or(false)
+    }
+
+    /// True when `sandbox = false` is combined with `sandbox-required`. Callers
+    /// warn about it once per session; the sandbox stays enabled either way.
+    pub fn sandbox_setting_conflict(&self, cfg: &config::Config) -> bool {
+        !self.sandbox && cfg.sandbox == Some(false) && self.resolve_sandbox_required(cfg)
     }
 
     pub fn resolve_sandbox_backend(&self, cfg: &config::Config) -> String {
@@ -265,6 +404,27 @@ impl Cli {
             .clone()
             .or_else(|| cfg.sandbox_backend.clone())
             .unwrap_or_else(|| "bwrap".to_string())
+    }
+
+    /// Raw `sandbox-expose` values, unexpanded and unvalidated: a non-empty
+    /// CLI list replaces the config list wholesale, following the existing
+    /// CLI-over-config resolution convention. `~` expansion and validation
+    /// against the mask list happen in `sandbox::partition_expose`.
+    pub fn resolve_sandbox_expose(&self, cfg: &config::Config) -> Vec<String> {
+        if !self.sandbox_expose.is_empty() {
+            self.sandbox_expose.clone()
+        } else {
+            cfg.sandbox_expose.clone().unwrap_or_default()
+        }
+    }
+
+    /// Whether sandboxed bash commands keep the host network. Unlike the other
+    /// sandbox flags this one takes a value: it defaults to true, so a bare
+    /// switch could only ever say "true" again and never turn the network off
+    /// from the command line. `Option<bool>` lets the CLI win in both
+    /// directions over the config key.
+    pub fn resolve_sandbox_network(&self, cfg: &config::Config) -> bool {
+        self.sandbox_network.or(cfg.sandbox_network).unwrap_or(true)
     }
 
     pub fn resolve_shell(&self, cfg: &config::Config) -> String {
@@ -298,5 +458,55 @@ impl Cli {
     #[cfg(feature = "git-worktree")]
     pub fn resolve_wt_force(&self, cfg: &config::Config) -> bool {
         self.wt_force || cfg.wt_force.unwrap_or(false)
+    }
+
+    #[cfg(feature = "advisor")]
+    pub fn resolve_advisor_enabled(&self, cfg: &config::Config) -> bool {
+        if let Some(ref ac) = cfg.advisor {
+            self.advisor || ac.enabled
+        } else {
+            self.advisor
+        }
+    }
+
+    #[cfg(feature = "advisor")]
+    pub fn resolve_advisor_model(&self, cfg: &config::Config) -> String {
+        self.advisor_model
+            .clone()
+            .or_else(|| {
+                cfg.advisor
+                    .as_ref()
+                    .and_then(|a| a.model.clone())
+                    .map(|m| m.to_string())
+            })
+            .unwrap_or_else(|| "deepseek-v4-pro".to_string())
+    }
+
+    #[cfg(feature = "advisor")]
+    pub fn resolve_advisor_max_uses(&self, cfg: &config::Config) -> Option<usize> {
+        self.advisor_max_uses
+            .or_else(|| cfg.advisor.as_ref().and_then(|a| a.max_uses))
+    }
+
+    #[cfg(feature = "advisor")]
+    pub fn resolve_advisor_human_handoff(&self, cfg: &config::Config) -> bool {
+        self.advisor_human_handoff.unwrap_or_else(|| {
+            cfg.advisor
+                .as_ref()
+                .map(|a| a.human_handoff)
+                .unwrap_or(false)
+        })
+    }
+
+    #[cfg(feature = "advisor")]
+    pub fn resolve_advisor_kilobytes_limit(&self, cfg: &config::Config) -> u32 {
+        if self.advisor_kilobytes_limit != 256 {
+            self.advisor_kilobytes_limit
+        } else {
+            cfg.advisor
+                .as_ref()
+                .map(|a| a.advisor_kilobytes_limit)
+                .unwrap_or(256)
+        }
     }
 }

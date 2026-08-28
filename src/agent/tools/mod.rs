@@ -1,13 +1,15 @@
-mod bash;
+pub(crate) mod bash;
 pub(crate) mod crc;
 pub(crate) mod edit;
-mod find_files;
-mod grep;
-mod list_dir;
+pub(crate) mod find_files;
+pub(crate) mod grep;
+pub(crate) mod list_dir;
+#[cfg(feature = "lsp")]
+pub(crate) mod lsp;
 pub(crate) mod normalize;
 pub(crate) mod read;
 pub(crate) mod todo;
-mod write;
+pub(crate) mod write;
 
 pub(crate) use normalize::{levenshtein_similarity, normalize_whitespace};
 
@@ -81,9 +83,6 @@ use serde::Deserialize;
 
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 use crate::permission::checker::{CheckResult, PermCheck};
-
-pub const MAX_GREP_RESULTS: usize = 200;
-pub const MAX_FIND_RESULTS: usize = 200;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {

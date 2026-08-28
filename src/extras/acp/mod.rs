@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_client_protocol::on_receive_request;
-use agent_client_protocol::schema::*;
+use agent_client_protocol::schema::v1::*;
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, Responder, Role, Stdio,
 };
+use compact_str::CompactString;
 use tokio::sync::Mutex;
 
 use crate::cli::Cli;
@@ -17,7 +18,7 @@ use crate::event::AgentEvent;
 use crate::permission::SecurityMode;
 use crate::permission::ask::AskSender;
 use crate::permission::checker::{PermCheck, PermissionChecker};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{SandboxSettings, SandboxSetup};
 
 const AGENT_VERSION: &str = "1.0.5";
 
@@ -30,6 +31,21 @@ struct AcpState {
     cfg: Config,
     context: ContextFiles,
     sessions: Mutex<HashMap<SessionId, SessionState>>,
+}
+
+/// The session sandbox and the warnings building it produced, from this
+/// server's resolved settings. Shared by `handle_new_session` (which logs the
+/// warnings once) and `run_prompt` (which needs the sandbox on every prompt),
+/// so the two can never disagree about what is masked or exposed.
+fn sandbox_setup(state: &AcpState) -> SandboxSetup {
+    crate::sandbox::build_sandbox(&SandboxSettings {
+        enabled: state.cli.resolve_sandbox(&state.cfg),
+        required: state.cli.resolve_sandbox_required(&state.cfg),
+        backend: &state.cli.resolve_sandbox_backend(&state.cfg),
+        shell: &state.cli.resolve_shell(&state.cfg),
+        expose: &state.cli.resolve_sandbox_expose(&state.cfg),
+        network: state.cli.resolve_sandbox_network(&state.cfg),
+    })
 }
 
 // --- TCP Transport ---
@@ -75,6 +91,13 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 // --- Server Entry Point ---
 
 pub async fn serve(cli: Cli, cfg: Config, context: ContextFiles) -> anyhow::Result<()> {
+    let transport_mode = if cli.acp_host.is_some() {
+        "tcp"
+    } else {
+        "stdio"
+    };
+    tracing::info!("ACP server starting: transport={}", transport_mode);
+
     // Extract transport config before moving cli into Arc
     let acp_host = cli.acp_host.clone();
     let acp_port = cli.acp_port;
@@ -179,6 +202,21 @@ async fn handle_new_session(
         req.cwd.display()
     );
 
+    if state.cli.sandbox_setting_conflict(&state.cfg) {
+        tracing::warn!(
+            "sandbox is set to false but sandbox-required is set, enabling the sandbox anyway"
+        );
+    }
+    // Sandbox warnings are emitted once per session, so they live here and not
+    // in run_prompt (which runs on every prompt). The sandbox itself is rebuilt
+    // per prompt from the same settings; building it here is what makes the
+    // warnings describe the sandbox that will actually run, including the
+    // directory it binds, which is this process's working directory and not
+    // `req.cwd` (the ACP server never chdirs to it).
+    for warning in &sandbox_setup(state).warnings {
+        tracing::warn!("{warning}");
+    }
+
     state.sessions.lock().await.insert(
         session_id.clone(),
         SessionState {
@@ -237,6 +275,13 @@ async fn run_prompt(
     let provider_str = state.cli.resolve_provider(&state.cfg);
     let mut model_str = state.cli.resolve_model(&state.cfg);
 
+    tracing::debug!(
+        "ACP run_prompt: provider={}, model={}, prompt_len={}",
+        provider_str,
+        model_str,
+        prompt_text.len(),
+    );
+
     // Custom provider model override (if no explicit model set)
     if (model_str.as_str() == "deepseek/deepseek-v4-pro" || state.cli.model.is_none())
         && let Some(custom) = state.cfg.custom_providers_map().get(provider_str.as_str())
@@ -256,11 +301,9 @@ async fn run_prompt(
     let model = client.completion_model(model_str.to_string());
 
     let (permission, ask_tx) = build_acp_permission(state);
-    let sandbox = Sandbox::new(
-        state.cli.resolve_sandbox(&state.cfg),
-        &state.cli.resolve_sandbox_backend(&state.cfg),
-    )
-    .with_shell(&state.cli.resolve_shell(&state.cfg));
+    // Warnings are dropped here on purpose: handle_new_session already logged
+    // them once for this session.
+    let sandbox = sandbox_setup(state).sandbox;
 
     // Track session history for future context persistence
     let _extra_messages = {
@@ -271,6 +314,8 @@ async fn run_prompt(
             .unwrap_or_default()
     };
 
+    let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, &model_str);
+    let extra_body = crate::config::resolve_extra_body(&state.cfg, &model_str);
     let agent = crate::provider::build_agent(
         model,
         &state.cli,
@@ -280,15 +325,29 @@ async fn run_prompt(
         ask_tx,
         sandbox,
         false,
+        temperature,
+        extra_body,
         #[cfg(feature = "mcp")]
         None::<&crate::extras::mcp::McpClientManager>,
     )
     .await;
 
-    let runner = agent.spawn_runner(prompt_text.to_string(), vec![]);
+    let runner = agent
+        .spawn_runner(
+            prompt_text.to_string(),
+            vec![],
+            crate::retry::RetryConfig::default(),
+            #[cfg(feature = "hooks")]
+            None,
+        )
+        .await;
     let mut rx = runner.event_rx;
 
-    let mut tool_call_id: Option<ToolCallId> = None;
+    // In-flight main-agent calls by `AgentEvent` id (rig's
+    // `internal_call_id`) to the ACP ToolCallId announced for them. A map,
+    // not a single slot: a parallel batch streams every `ToolCall` before
+    // the first `ToolResult`.
+    let mut tool_call_ids: HashMap<CompactString, ToolCallId> = HashMap::new();
     let mut final_response = String::new();
 
     while let Some(event) = rx.recv().await {
@@ -316,9 +375,13 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send reasoning notification: {}", e);
                 }
             }
-            AgentEvent::ToolCall { name, args } => {
+            AgentEvent::ToolCall {
+                call_id: event_id,
+                name,
+                args,
+            } => {
                 let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                tool_call_id = Some(id.clone());
+                tool_call_ids.insert(event_id, id.clone());
                 let args_str = args.to_string();
                 let tool_call = ToolCall::new(id.clone(), name.to_string())
                     .raw_input(serde_json::from_str(&args_str).ok());
@@ -331,10 +394,16 @@ async fn run_prompt(
                 }
             }
             AgentEvent::SubagentToolCall { name, args } => {
+                // Announce-only: subagent calls carry no correlating id, so
+                // they never receive a ToolCallUpdate. (Previously they
+                // hijacked the single pending slot, so the enclosing `task`
+                // call's result got attached to the subagent's entry.)
+                // Announced as already Completed, since nothing will ever
+                // update it out of the default Pending status.
                 let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-                tool_call_id = Some(id.clone());
                 let args_str = args.to_string();
                 let tool_call = ToolCall::new(id.clone(), format!("[subagent] {}", name))
+                    .status(ToolCallStatus::Completed)
                     .raw_input(serde_json::from_str(&args_str).ok());
                 let notif = SessionNotification::new(
                     session_id.clone(),
@@ -344,10 +413,22 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send subagent tool call notification: {}", e);
                 }
             }
-            AgentEvent::ToolResult { output, .. } => {
-                let id = tool_call_id
-                    .take()
-                    .unwrap_or_else(|| ToolCallId::new(uuid::Uuid::new_v4().to_string()));
+            AgentEvent::ToolResult {
+                call_id: event_id,
+                output,
+                ..
+            } => {
+                // No announced ToolCall to update: an update carrying a
+                // ToolCallId the client was never told about is worse than
+                // silence, so drop it.
+                let Some(id) = tool_call_ids.remove(&event_id) else {
+                    tracing::warn!(
+                        "ACP tool result with no announced tool call (id={}); \
+                         skipping update",
+                        event_id.escape_debug(),
+                    );
+                    continue;
+                };
                 let fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
                     .content(vec![ToolCallContent::from(ContentBlock::Text(
@@ -362,11 +443,41 @@ async fn run_prompt(
                     tracing::warn!("ACP failed to send tool result notification: {}", e);
                 }
             }
+            AgentEvent::Retrying { attempt, max } => {
+                // ACP has no status bar, so surface the retry as an agent
+                // thought. This keeps the client from going silent during the
+                // backoff delay and mirrors how `Reasoning` is forwarded.
+                let text = format!("retrying... ({}/{})", attempt, max);
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentThoughtChunk(chunk),
+                );
+                if let Err(e) = cx.send_notification(notif) {
+                    tracing::warn!("ACP failed to send retry notification: {}", e);
+                }
+            }
+            AgentEvent::CompletionCall { .. } => {
+                // Mid-stream provider usage; ACP has no status bar to update, so
+                // there is nothing to surface for this event.
+            }
             AgentEvent::Done { .. } => {
                 break;
             }
-            AgentEvent::Error(_) => {
-                break;
+            AgentEvent::Error(err) => {
+                // Surface the error to the client instead of silently
+                // reporting EndTurn.
+                let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(format!(
+                    "[error: {}]",
+                    err
+                ))));
+                let notif = SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(chunk),
+                );
+                let _ = cx.send_notification(notif);
+                let _ = responder.respond(PromptResponse::new(StopReason::Refusal));
+                return Ok(());
             }
         }
     }
@@ -401,7 +512,22 @@ fn build_acp_permission(state: &AcpState) -> (Option<PermCheck>, Option<AskSende
     let checker = PermissionChecker::new(&perm_config, mode, None, permission_modes);
     let perm: PermCheck = Arc::new(StdMutex::new(checker));
 
-    let (ask_tx, _ask_rx) = tokio::sync::mpsc::channel(64);
+    let (ask_tx, mut ask_rx) = tokio::sync::mpsc::channel::<crate::permission::ask::AskRequest>(64);
+    // ACP is headless — there is no interactive user to prompt. Auto-approve
+    // Ask requests so tools don't fail with "Permission system unavailable".
+    // Log a warning so the auto-approval is visible in logs.
+    tokio::spawn(async move {
+        while let Some(req) = ask_rx.recv().await {
+            tracing::warn!(
+                "ACP auto-approving tool call: tool={}, input_len={}",
+                req.tool,
+                req.input.len()
+            );
+            let _ = req
+                .reply
+                .send(crate::permission::ask::UserDecision::AllowOnce);
+        }
+    });
 
     (Some(perm), Some(ask_tx))
 }

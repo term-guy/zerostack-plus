@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 use smallvec::SmallVec;
@@ -13,23 +15,18 @@ use crate::permission::ask::AskSender;
 use crate::permission::checker::PermCheck;
 use crate::sandbox::Sandbox;
 
-#[allow(clippy::too_many_arguments)]
-pub async fn build_agent_inner<M: CompletionModel + 'static>(
-    model: M,
-    cli: &Cli,
-    cfg: &Config,
-    context: &ContextFiles,
-    permission: Option<PermCheck>,
-    ask_tx: Option<AskSender>,
-    sandbox: Sandbox,
-    reasoning_enabled: bool,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-) -> Agent<M> {
+/// Assemble the system-prompt preamble every request carries: the base
+/// `SYSTEM_PROMPT`, tool-use guidance, context files (AGENTS.md, ARCHITECTURE.md,
+/// active mode prompt), working directory, `/add`ed files, memory, and the user
+/// `SUFFIX.md`. Extracted from [`build_agent_inner`] so its token cost can be
+/// estimated (see [`estimate_overhead`]) without building an `Agent`.
+pub fn build_preamble(context: &ContextFiles, reasoning_enabled: bool) -> String {
     let reasoning_prefix = if reasoning_enabled {
         "You reason carefully and think step-by-step.\n\n"
     } else {
         "You respond concisely without showing your reasoning.\n\n"
     };
+    let suffix = crate::session::storage::load_suffix();
     let context_agents = context.agents.as_deref().unwrap_or("");
     #[cfg(feature = "archmd")]
     let context_architecture = context.architecture.as_deref().unwrap_or("");
@@ -68,14 +65,33 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         + context.memory.as_deref().map_or(0, |m| m.len() + 8) // "\n\n---\n\n" + content
         + crate::agent::prompt::MEMORY_TOOLS_PROMPT.len();
 
-    // Add extra files content to preamble budget
+    let total_len = total_len + suffix.as_ref().map_or(0, |s| s.len() + 6); // "\n\n---\n\n"
+
+    // Add extra files content to preamble budget. Cap each file to prevent a
+    // huge file from blowing up the system prompt past the context window.
+    const MAX_EXTRA_FILE_BYTES: usize = 524_288;
     let extra_files_content: Vec<String> = context
         .extra_files
         .iter()
         .filter_map(|p| {
-            std::fs::read_to_string(p)
-                .ok()
-                .map(|content| format!("Content of {}:\n{}", p.display(), content))
+            let content = std::fs::read_to_string(p).ok()?;
+            let truncated = if content.len() > MAX_EXTRA_FILE_BYTES {
+                tracing::warn!(
+                    "extra file {} exceeds {} bytes, truncated for preamble",
+                    p.display(),
+                    MAX_EXTRA_FILE_BYTES
+                );
+                let mut end = MAX_EXTRA_FILE_BYTES;
+                while !content.is_char_boundary(end) && end > 0 {
+                    end -= 1;
+                }
+                let mut t = content[..end].to_string();
+                t.push_str("\n\n[truncated — file exceeded preamble size limit]");
+                t
+            } else {
+                content
+            };
+            Some(format!("Content of {}:\n{}", p.display(), truncated))
         })
         .collect();
     let extra_files_len: usize = extra_files_content.iter().map(|s| s.len() + 2).sum();
@@ -112,8 +128,92 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
         preamble.push_str(crate::agent::prompt::MEMORY_TOOLS_PROMPT);
     }
+    if let Some(s) = &suffix {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(s);
+    }
+    preamble
+}
+
+/// Estimate the token cost of the fixed request overhead (the preamble from
+/// [`build_preamble`]). Stored on the session and added to the context figure
+/// before the first real calibration. Does not yet include tool-schema tokens;
+/// the provider's first usage report folds those into the calibration anchor.
+pub fn estimate_overhead(context: &ContextFiles, reasoning_enabled: bool) -> u64 {
+    crate::session::Session::estimate_tokens(&build_preamble(context, reasoning_enabled))
+}
+
+/// Retain only the tools whose names appear in `allowlist`. An empty
+/// allowlist passes everything through unchanged. Unrecognized names are
+/// logged as warnings and ignored.
+pub(crate) fn filter_tools_by_allowlist(
+    tools: Vec<Box<dyn rig::tool::ToolDyn>>,
+    allowlist: &[String],
+) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    if allowlist.is_empty() {
+        return tools;
+    }
+    let allowed: HashSet<&str> = allowlist.iter().map(|s| s.as_str()).collect();
+    for name in &allowed {
+        if !tools.iter().any(|t| t.name() == *name) {
+            tracing::warn!("--tools: unknown tool '{name}' (ignored)");
+        }
+    }
+    tools
+        .into_iter()
+        .filter(|t| allowed.contains(t.name().as_str()))
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn build_agent_inner<M: CompletionModel + 'static>(
+    model: M,
+    cli: &Cli,
+    cfg: &Config,
+    context: &ContextFiles,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    sandbox: Sandbox,
+    reasoning_enabled: bool,
+    temperature: Option<f64>,
+    // Provider-specific extra body params (e.g. OpenRouter `provider.order` to
+    // pin Claude to the Anthropic direct route so `cache_control` is honored).
+    // `None` for providers that need no extra routing.
+    additional_params: Option<serde_json::Value>,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+) -> Agent<M> {
+    #[cfg(feature = "lsp")]
+    let lsp_manager = if cli.resolve_no_tools(cfg) {
+        None
+    } else {
+        cfg.resolve_lsp().map(|c| {
+            crate::extras::lsp::LspManager::new(c, std::env::current_dir().unwrap_or_default())
+        })
+    };
+
+    #[cfg(feature = "rtk")]
+    let rtk = if cli.resolve_no_tools(cfg) {
+        None
+    } else {
+        crate::extras::rtk::Rtk::detect(cfg.resolve_rtk()).await
+    };
+
+    #[cfg_attr(not(any(feature = "lsp", feature = "rtk")), allow(unused_mut))]
+    let mut preamble = build_preamble(context, reasoning_enabled);
+    #[cfg(feature = "lsp")]
+    if lsp_manager.is_some() {
+        preamble.push_str(crate::agent::prompt::LSP_PROMPT);
+    }
+    #[cfg(feature = "rtk")]
+    if rtk.is_some() {
+        preamble.push_str(crate::agent::prompt::RTK_PROMPT);
+    }
 
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
+
+    if let Some(params) = additional_params {
+        builder = builder.additional_params(params);
+    }
 
     let max_tokens = cli.resolve_max_tokens(cfg);
     builder = builder.max_tokens(max_tokens);
@@ -121,59 +221,101 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     let max_turns = cli.resolve_max_agent_turns(cfg);
     builder = builder.default_max_turns(max_turns);
 
-    if let Some(temp) = cli.temperature {
-        let clamped = temp.clamp(0.0, 2.0);
-        builder = builder.temperature(clamped);
+    if let Some(temp) = temperature {
+        builder = builder.temperature(temp);
     }
 
     if cli.resolve_no_tools(cfg) {
         builder.build()
     } else {
         let max_text_file_size = cfg.max_text_file_size;
+        let max_read_lines = cfg.resolve_max_read_lines();
+        let max_bash_output_lines = cfg.resolve_max_bash_output_lines();
+        let max_grep_results = cfg.resolve_max_grep_results();
+        let max_find_results = cfg.resolve_max_find_results();
+        let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
+        let write_tool =
+            tools::WriteTool::new(permission.clone(), ask_tx.clone(), max_text_file_size);
+        #[cfg(feature = "lsp")]
+        let write_tool = write_tool.with_lsp(lsp_manager.clone());
+        let edit_tool = tools::EditTool::new(permission.clone(), ask_tx.clone());
+        #[cfg(feature = "lsp")]
+        let edit_tool = edit_tool.with_lsp(lsp_manager.clone());
         let base_tools: SmallVec<[Box<dyn rig::tool::ToolDyn>; 8]> = SmallVec::from_buf([
             Box::new(tools::ReadTool::new(
                 permission.clone(),
                 ask_tx.clone(),
                 max_text_file_size,
+                max_read_lines,
             )),
-            Box::new(tools::WriteTool::new(
-                permission.clone(),
-                ask_tx.clone(),
-                max_text_file_size,
-            )),
-            Box::new(tools::EditTool::new(permission.clone(), ask_tx.clone())),
+            Box::new(write_tool),
+            Box::new(edit_tool),
             Box::new(tools::BashTool::new(
                 permission.clone(),
                 ask_tx.clone(),
                 sandbox.clone(),
+                max_bash_output_lines,
+                #[cfg(feature = "rtk")]
+                rtk,
             )),
-            Box::new(tools::GrepTool::new(permission.clone(), ask_tx.clone())),
+            Box::new(tools::GrepTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                max_grep_results,
+            )),
             Box::new(tools::FindFilesTool::new(
                 permission.clone(),
                 ask_tx.clone(),
+                max_find_results,
             )),
-            Box::new(tools::ListDirTool::new(permission.clone(), ask_tx.clone())),
+            Box::new(tools::ListDirTool::new(
+                permission.clone(),
+                ask_tx.clone(),
+                max_list_dir_entries,
+            )),
             Box::new(tools::WriteTodoList::new(
                 permission.clone(),
                 ask_tx.clone(),
             )),
         ]);
 
-        let mut builder = builder.tools(base_tools.into_vec());
+        #[cfg_attr(
+            not(any(
+                feature = "subagents",
+                feature = "memory",
+                feature = "mcp",
+                feature = "advisor",
+                feature = "lsp"
+            )),
+            allow(unused_mut)
+        )]
+        let mut all_tools: Vec<Box<dyn rig::tool::ToolDyn>> = base_tools.into_vec();
 
         #[cfg(feature = "subagents")]
         if cfg.task_enabled.unwrap_or(true) {
             use crate::extras::subagents::task_tool::TaskTool;
-            builder = builder.tool(TaskTool::new(permission.clone(), ask_tx.clone()));
+            all_tools.push(Box::new(TaskTool::new(permission.clone(), ask_tx.clone())));
         }
 
         #[cfg(feature = "memory")]
         {
-            use crate::extras::memory::{MemoryRead, MemorySearch, MemoryWrite};
-            builder = builder
-                .tool(MemoryWrite::new(permission.clone(), ask_tx.clone()))
-                .tool(MemoryRead::new(permission.clone(), ask_tx.clone()))
-                .tool(MemorySearch::new(permission.clone(), ask_tx.clone()));
+            use crate::extras::memory::{MemoryEdit, MemoryRead, MemorySearch, MemoryWrite};
+            all_tools.push(Box::new(MemoryWrite::new(
+                permission.clone(),
+                ask_tx.clone(),
+            )));
+            all_tools.push(Box::new(MemoryEdit::new(
+                permission.clone(),
+                ask_tx.clone(),
+            )));
+            all_tools.push(Box::new(MemoryRead::new(
+                permission.clone(),
+                ask_tx.clone(),
+            )));
+            all_tools.push(Box::new(MemorySearch::new(
+                permission.clone(),
+                ask_tx.clone(),
+            )));
         }
 
         #[cfg(feature = "mcp")]
@@ -187,16 +329,28 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             let mcp_tools = manager
                 .collect_tools(permission.clone(), ask_tx.clone())
                 .await;
-            if !mcp_tools.is_empty() {
-                let dyn_tools: Vec<Box<dyn rig::tool::ToolDyn>> = mcp_tools
-                    .into_iter()
-                    .map(|t| Box::new(t) as Box<dyn rig::tool::ToolDyn>)
-                    .collect();
-                builder = builder.tools(dyn_tools);
+            for t in mcp_tools {
+                all_tools.push(Box::new(t) as Box<dyn rig::tool::ToolDyn>);
             }
         }
 
-        builder.build()
+        #[cfg(feature = "advisor")]
+        if crate::extras::advisor::with_config(|c| c.enabled) {
+            use crate::extras::advisor::AdvisorTool;
+            all_tools.push(Box::new(AdvisorTool::new()));
+        }
+
+        #[cfg(feature = "lsp")]
+        if let Some(lsp) = &lsp_manager {
+            all_tools.push(Box::new(tools::lsp::LspTool::new(lsp.clone())));
+        }
+
+        let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
+
+        #[cfg(feature = "hooks")]
+        let all_tools = crate::extras::hooks::wrap_from_global(all_tools, permission.clone());
+
+        builder.tools(all_tools).build()
     }
 }
 
@@ -243,6 +397,9 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     _reasoning_enabled: bool,
+    temperature: Option<f64>,
+    // See `build_agent_inner`: OpenRouter `provider.order` pin for `anthropic/*`.
+    additional_params: Option<serde_json::Value>,
 ) -> Agent<M> {
     let cwd = std::env::current_dir()
         .ok()
@@ -283,6 +440,11 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     #[cfg(feature = "memory")]
     crate::extras::memory::append_memory_block(&mut preamble, context.memory.as_deref());
 
+    if let Some(s) = crate::session::storage::load_suffix() {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(&s);
+    }
+
     let max_tokens = cli.resolve_max_tokens(cfg);
 
     // Honor --no-tools: fall back to a pure-context, single-turn answer.
@@ -291,8 +453,11 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
             .preamble(&preamble)
             .default_max_turns(1)
             .max_tokens(max_tokens);
-        if let Some(temp) = cli.temperature {
-            builder = builder.temperature(temp.clamp(0.0, 2.0));
+        if let Some(params) = additional_params.clone() {
+            builder = builder.additional_params(params);
+        }
+        if let Some(temp) = temperature {
+            builder = builder.temperature(temp);
         }
         return builder.build();
     }
@@ -302,18 +467,32 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
     // effects to roll back and never mutates the session. Allow multiple turns
     // so it can read then answer.
     let max_text_file_size = cfg.max_text_file_size;
+    let max_read_lines = cfg.resolve_max_read_lines();
+    let max_grep_results = cfg.resolve_max_grep_results();
+    let max_find_results = cfg.resolve_max_find_results();
+    let max_list_dir_entries = cfg.resolve_max_list_dir_entries();
     let read_tools: Vec<Box<dyn rig::tool::ToolDyn>> = vec![
         Box::new(tools::ReadTool::new(
             permission.clone(),
             ask_tx.clone(),
             max_text_file_size,
+            max_read_lines,
         )),
-        Box::new(tools::GrepTool::new(permission.clone(), ask_tx.clone())),
+        Box::new(tools::GrepTool::new(
+            permission.clone(),
+            ask_tx.clone(),
+            max_grep_results,
+        )),
         Box::new(tools::FindFilesTool::new(
             permission.clone(),
             ask_tx.clone(),
+            max_find_results,
         )),
-        Box::new(tools::ListDirTool::new(permission.clone(), ask_tx.clone())),
+        Box::new(tools::ListDirTool::new(
+            permission.clone(),
+            ask_tx.clone(),
+            max_list_dir_entries,
+        )),
     ];
 
     let mut builder = AgentBuilder::new(model)
@@ -322,8 +501,12 @@ pub fn build_btw_agent_inner<M: CompletionModel + 'static>(
         .max_tokens(max_tokens)
         .tools(read_tools);
 
-    if let Some(temp) = cli.temperature {
-        builder = builder.temperature(temp.clamp(0.0, 2.0));
+    if let Some(params) = additional_params {
+        builder = builder.additional_params(params);
+    }
+
+    if let Some(temp) = temperature {
+        builder = builder.temperature(temp);
     }
 
     builder.build()

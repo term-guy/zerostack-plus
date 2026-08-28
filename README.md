@@ -6,9 +6,9 @@
 
 Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/latest/usage) and [opencode](https://opencode.ai/). A fork of [zerostack](https://github.com/gi-dellav/zerostack) with additional provider support.
 
-*blogposts:* [what we built in 2 weeks](https://rocketup.pages.dev/posts/what_we_built_in_2_weeks/) [memory design](https://rocketup.pages.dev/posts/how-zerostack-memory-works/) [subagents design](https://rocketup.pages.dev/posts/how-zerostack-subagents-work/)
+*blogposts:* [what we built in 2 weeks](https://rocketup.pages.dev/posts/what_we_built_in_2_weeks/) [memory design](https://rocketup.pages.dev/posts/how-zerostack-memory-works/) [subagents design](https://rocketup.pages.dev/posts/how-zerostack-subagents-work/) [xavier's memory analysis](https://xavierforge.dev/en/posts/zerostack-memory-design/)
 
-<a href="https://www.producthunt.com/products/zerostack-coding-agent/reviews/new?utm_source=badge-product_review&utm_medium=badge&utm_source=badge-zerostack&#0045;coding&#0045;agent" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/product_review.svg?product_id=1236867&theme=light" alt="Zerostack&#0032;Coding&#0032;Agent - A&#0032;minimal&#0032;coding&#0032;agent&#0044;&#0032;with&#0032;a&#0032;bundle&#0032;of&#0032;innovative&#0032;features | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+*note:* Want to support? Consider [donating here](https://ko-fi.com/gidellav); if you are a company interested in sponsoring zerostack, [contact me here](mailto:giuseppe.dellavedova8+sponsor@gmail.com).
 
 ## Features
 
@@ -24,8 +24,13 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **Integrated Git Worktrees integration**: Use `/worktree` to move the agent from one worktree to another.
 - **ACP support** (gated): Agent Communication Protocol server — lets editors (Zed, etc.) connect to zerostack as an ACP agent
 - **Persistent memory** (gated): plain-Markdown memory across sessions: a global MEMORY.md plus per-project daily logs, scratchpad, and notes, injected into the system prompt each session
+- **Lifecycle hooks** (gated): observe or gate tool calls, prompts, and session lifecycle events via external commands, using a `settings.json` schema largely compatible with Claude Code hooks
+- **Advisor** (gated): a second model the agent can consult mid-session for strategic guidance, with an optional human-handoff mode
+- **Multimodal input** (gated): attach images and PDFs to messages
 - **Subagents**: Parallel and fast, used for exploring the codebase
 - **ARCHITECTURE.md**: Our own companion file for AGENTS.md, it allows to offer a shared core knowledge for all agents working on the same codebase
+- **Prompt chaining**: offers to advance brainstorm → plan → code → review as each phase finishes, config-gated per transition
+- **Status signals**: emits start/stop/git-conflict events over a Unix socket for external status bars or tooling
 
 **NOTE**: Windows support is not tested is any way, but feel free to try and open an issue if you encounter any bugs!
 
@@ -33,14 +38,28 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 
 _zerostack-plus_ is one of the smallest and most performant coding agents on the market.
 
-- Lines of code: ~17k LoC
+- Lines of code: ~30k LoC (core, excluding tests)
 - Binary size: 26MB
 - RAM footprint: ~16MB on average, with peaks at ~24MB (vs ~300MB with peaks at ~700MB for opencode or other JS-based coding agents)
 - CPU usage: 0.0% on idle, ~1.5% when using tools (measured on an Intel i5 7th gen, vs ~2% on idle and ~20% when working for opencode)
 
+## Star History
+
+<a href="https://star-history.dera.page/#gi-dellav/zerostack&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gi-dellav/zerostack&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gi-dellav/zerostack&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=gi-dellav/zerostack&type=date&legend=top-left" />
+ </picture>
+</a>
+
+## (NEW) Get Started
+
+You can now read a complete *Get Started* guide for zerostack [here](https://github.com/gi-dellav/zerostack/blob/main/docs/GET_STARTED.md)!
+
 ## Installation
 
-In order to install _zerostack-plus_, you must have Cargo and git installed. Then, run:
+_zerostack-plus_ is a fork and is not published to crates.io; install it from git. You must have Cargo and git installed. Then, run:
 
 ```bash
 # Default — MCP, loop, and git-worktree included
@@ -51,25 +70,37 @@ cargo install --git https://github.com/term-guy/zerostack-plus --features acp
 
 # All features
 cargo install --git https://github.com/term-guy/zerostack-plus --features "acp,loop,git-worktree,mcp"
-
-# With Memory support
-cargo install zerostack --features memory
-
-# With experimental multi-threaded subagents
-cargo install zerostack --features multithread
 ```
 
-You are now ready to work with a lightweight coding agent! (You can also find pre-built binaries on Github Releases)
+### Nix
+
+Add as an overlay to your system/project:
+
+```nix
+let
+  pkgs = import nixpkgs {
+    overlays = [
+      # src thru input pinning mechanism, or use builtins.fetchTarball
+      (import "${zerostack-src}/nix/overlay")
+    ];
+  };
+in
+pkgs.zerostack
+```
+
 
 Once installed, run `/prompt autoconfig` inside zerostack to explore the documentation and configure the tool interactively.
 
 _note:_ If you have questions or you want to collaborate on the project, please join the [dedicated Matrix chatroom](https://app.element.io/#/room/#zerostack-general:matrix.org).
 
+If you want to orchestrate multiple zerostack agents from the terminal, also install [multistack](https://github.com/gi-dellav/multistack).
+
 ### Optional: sandbox mode
 
 Install [bubblewrap](https://github.com/containers/bubblewrap) for `--sandbox`,
-which runs every bash command inside an isolated environment to protect your
-system from accidental or malicious damage:
+which runs every bash command inside an isolated environment to contain the
+damage a mistaken command can do to your system (a seatbelt, not a boundary
+against untrusted code):
 
 ```bash
 # Debian/Ubuntu
@@ -82,7 +113,36 @@ dnf install bubblewrap
 pacman -S bubblewrap
 ```
 
-There is also support for zerobox as an alternative sandbox backend.
+There is also support for [zerobox](https://github.com/afshinm/zerobox) as an
+alternative sandbox backend. bubblewrap is Linux only, so on macOS install
+zerobox (`cargo install zerobox`) and set `sandbox-backend = "zerobox"`.
+
+`--sandbox` is best effort: when the selected backend binary is missing, bash
+commands still run, but unsandboxed, with a warning in the logs. Add
+`--sandbox-required` (or `sandbox-required = true` in the config) to turn that
+into a guarantee: bash commands are refused whenever the backend is unavailable,
+and the rest of the session keeps working. See [SECURITY.md](SECURITY.md) for
+what the sandbox does and does not protect against.
+
+With the `bwrap` backend, well-known credential directories (`~/.ssh`,
+`~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, and the `gh`, `gcloud`, `op` and
+`sops/age` directories under the config base) are masked by default, so
+sandboxed commands read them as empty rather than as your keys and tokens,
+and the advertised ssh-agent is unreachable. `sandbox-expose` (config key or
+repeatable `--sandbox-expose <path>` flag) restores read-only access to one
+entry or a subpath of one. See [docs/CONFIG.md](docs/CONFIG.md) for the key
+and [SECURITY.md](SECURITY.md) for the full threat model.
+
+Sandboxed commands keep the host network by default. `sandbox-network = false`
+(or `--sandbox-network=false`) takes it away, which is what stops a command
+that read something sensitive from sending it anywhere. Each bash call then
+gets a fresh network namespace with only its own private loopback: a server the
+command starts and uses within that same command still works, but the internet,
+the LAN, and anything already listening on your machine (a dev server, a local
+registry) are unreachable, and the namespace itself is gone by the next bash
+call, taking anything bound to it (like a backgrounded server) with it; the
+working directory, by contrast, is shared with the host and persists across
+calls. That tradeoff is why the network stays open unless you ask.
 
 ## Quick start
 
@@ -138,6 +198,10 @@ Built-in prompts:
 | **`review-security`** | Security review mode — finds exploitable vulnerabilities                 |
 | **`simplify`**        | Code simplification mode — refines for clarity without changing behavior |
 | **`write-prompt`**    | Prompt writing mode — creates and optimizes agent prompts                |
+| **`refactor`**        | Refactoring mode — restructures code for design and maintainability while preserving behavior |
+| **`autoconfig`**      | Configuration mode — reads docs and edits your config/prompts, writes no code |
+| **`orchestrator`**    | Orchestration mode — combines direct tool use with parallel `zerostack` subprocess invocations for heavier work |
+| **`write-text`**      | Prose-writing mode — drafts and reviews non-code writing (docs, posts, emails) |
 
 You can also create custom prompts by placing markdown files in
 `$XDG_CONFIG_HOME/zerostack/prompts/` and referencing them by name.
@@ -147,6 +211,14 @@ project root or any ancestor directory, injecting their contents into the
 system prompt. When enabled (feature `archmd`), `ARCHITECTURE.md` is also loaded
 the same way, providing high-level design context to speed up exploration.
 Use `-n` / `--no-context-files` to disable all context file loading.
+
+### Prompt chaining
+
+When `brainstorm`, `plan`, or `code` finishes, zerostack can offer to advance
+to the next phase (`brainstorm` → `plan` → `code` → `/review`), asking
+`Continue to plan? [Y/N/B]`-style at each step: `Y` advances, `N` stays put,
+and `B` ("but ...") advances with an extra instruction appended. Each
+transition is enabled independently in config.
 
 ## Permission system
 
@@ -188,6 +260,9 @@ This is a list of the most important slash commands:
 - `/mode` — Set the permission system's mode
 - `/queue` — Manage input queued while the agent is busy
 - `/btw` — Ask a quick side question in parallel without interrupting the agent
+- `/review` — Run a one-shot code review in readonly mode, then restore the previous prompt
+- `/hooks` (gated) — Show whether a hook dispatcher is installed and what it's configured for
+- `/advisor` (gated) — Show or change advisor status (enabled, mode, model, max uses)
 
 To see all of the commands, use `/help`.
 
@@ -245,11 +320,63 @@ so it remembers your preferences and recent context across runs.
 
 Global memory files are stored in `$XDG_DATA_HOME/zerostack/agent/memory/`.
 
+## Hooks
+
+**NOTE:** Hooks are gated behind the `hooks` feature and are not included in the
+default build. Install with `cargo install zerostack --features hooks`.
+
+With the `hooks` feature, external commands can observe or gate agent behavior
+at defined lifecycle events: a tool call (`PreToolUse`/`PostToolUse`), a user
+prompt (`UserPromptSubmit`), the agent finishing a turn (`Stop`), a session
+starting/ending, or a subagent starting/stopping. Hooks use the same
+`settings.json` shape, stdin envelope, and exit-code/stdout-JSON contract as
+Claude Code, so an existing CC hooks setup is largely compatible.
+
+Hook config lives in `settings.json` at up to three locations (global,
+project, and an admin-managed file), merged in that order. The project-level
+file is untrusted by default; zerostack asks for confirmation (tracked by
+hash) before running project hooks for the first time. Use `--no-hooks` to
+disable all non-managed hooks, or `--hooks-test <tool>` to dry-run
+`PreToolUse` hooks for a tool without starting a session. See
+[docs/CONFIG.md](docs/CONFIG.md#hooks) for the full configuration reference.
+
+## Advisor
+
+**NOTE:** Advisor is gated behind the `advisor` feature and is not included in
+the default build. Install with `cargo install zerostack --features advisor`.
+
+With the `advisor` feature, the agent can consult a second model mid-session
+for strategic guidance (architecture calls, edge cases, course correction)
+without derailing the main coding session. Enable it with `--advisor`, or
+toggle it at runtime with `/advisor on` / `/advisor off`. An optional
+human-handoff mode (`/advisor handoff on`) routes advisor calls to you
+instead of a model. See [docs/CONFIG.md](docs/CONFIG.md#advisor) for
+configuration.
+
+## Multimodal input
+
+**NOTE:** Multimodal input is gated behind the `multimodal` feature (images)
+and `pdf` feature (PDFs, implies `multimodal`), neither included in the
+default build.
+
+With these features enabled, you can attach images and PDFs to your messages
+(up to 20 MB per file) and the agent processes them via the underlying
+provider's multimodal support.
+
+## Status signals
+
+**NOTE:** Status signals require the `status-signals` feature, which is
+included in the default build.
+
+Pass `--status-socket <path>` to have zerostack emit `start`, `stop`, and
+`git-conflict` events over a Unix domain socket, for external status bars or
+tooling to watch.
+
 ## Parallel Agent
 
 If you want to make multiple agents work on the same repository without having to work with git worktrees,
 zerostack now ships with `--parallel`, which enables full management of a temporary git worktree that will
-be merged and removed before exiting the agent. 
+be merged and removed before exiting the agent.
 
 ## Loop system
 
@@ -308,6 +435,30 @@ The worktrees integrations offers 3 slash commands:
 3. **Merge** — `/wt-merge` tells the agent to merge the branch, push, clean up, and return to the main repo.
 4. **Exit** — `/wt-exit` immediately returns to the main repo without merging.
 
+### Auto-merge on exit
+
+When you quit zerostack while in a worktree, the `--wt-auto-merge` flag
+(or `--parallel`, which implies it) causes zerostack to attempt merging the
+worktree branch before exiting.
+
+- **Clean merge**: completes silently (merge, push, remove worktree, delete branch).
+- **Merge conflicts**: zerostack lists conflicting files and prompts:
+  ```
+  [a]bort  [l]eave for manual resolution  [h]elp (agent resolves)
+  ```
+  - `a` – abort the merge, restore clean state, do not delete the worktree.
+  - `l` – leave the conflict state in the main repo for manual `git mergetool`.
+  - `h` – abort the merge, then spawn the agent to redo the merge with
+    interactive conflict-resolution guidance (same as `/wt-merge`).
+
+| Flag | Description |
+|------|-------------|
+| `--worktree <name>` | Create a worktree on branch `<name>` and `cd` into it. |
+| `--wt-auto-merge`   | Auto-merge worktree branch on exit. |
+| `--parallel`        | Create a timestamped worktree with auto-merge on exit. |
+| `--wt-force`        | Force worktree remove and branch delete (`-D`) even if dirty. |
+| `--wt-base-dir <dir>` | Base directory for worktrees (default: parent of repo). |
+
 ## ACP (Agent Communication Protocol) support
 
 **ACP** is a JSON-RPC based protocol that standardizes communication between code editors
@@ -330,17 +481,13 @@ zerostack --acp --acp-host 0.0.0.0 --acp-port 7243
 
 ### ACP config
 
-In `~/.local/share/zerostack/config.json`:
+In `~/.local/share/zerostack/config.yaml`:
 
-```json
-{
-  "acp_servers": {
-    "my-editor": {
-      "host": "127.0.0.1",
-      "port": 7243
-    }
-  }
-}
+```yaml
+acp_servers:
+  my-editor:
+    host: 127.0.0.1
+    port: 7243
 ```
 
 ACP mode requires setting up an LLM provider (the standard `--provider`, `--model`,
@@ -359,7 +506,7 @@ and API key env vars apply). Without it, zerostack cannot process prompts.
 | `custom` | `CUSTOM_API_KEY` | Any OpenAI-compatible endpoint via `CUSTOM_BASE_URL` |
 
 Custom providers can also be configured with aliases, base URLs, and API key environment
-variables in `$XDG_CONFIG_HOME/zerostack/config.json` — see [CONFIG.md](CONFIG.md).
+variables in `$XDG_CONFIG_HOME/zerostack/config.toml` — see [CONFIG.md](CONFIG.md).
 
 ## License
 

@@ -1,3 +1,7 @@
+---
+description: "How ARCHITECTURE.md files give the zerostack agent and its subagents high-level design context about your project."
+---
+
 # ARCHITECTURE.md
 
 zerostack supports an optional `ARCHITECTURE.md` file that gives both the main
@@ -158,7 +162,7 @@ reproducing code; focus on structure, relationships, and rationale.
 
 ## Data Flow
 - User input → InputEditor → event loop → agent.spawn_runner()
-- Runner streams AgentEvent (Token, Reasoning, ToolCall, ToolResult, Done)
+- Runner streams AgentEvent (Token, Reasoning, ToolCall, ToolResult, Done); ToolCall/ToolResult carry a correlation `call_id` (rig's `internal_call_id`) so a parallel batch pairs each result with its own call
 - Events rendered incrementally via Renderer::write_line()
 
 ## Design Decisions
